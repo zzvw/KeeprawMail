@@ -136,15 +136,15 @@
                         <InfoBar.Content>
                             <StackPanel Spacing="6">
                                 <TextBlock TextWrapping="Wrap">
-                                    <Bold>HTTP</Bold>: 推荐用于 v2rayN、Clash 等混合端口代理，兼容性最佳 ✓
+                                    <Bold>HTTP</Bold>: HTTP 代理（IMAP/SMTP/HTTPS 通过 CONNECT 隧道）。Clash/v2rayN 的 HTTP 端口或 Mixed 端口均可。
                                 </TextBlock>
                                 <TextBlock TextWrapping="Wrap">
-                                    <Bold>SOCKS5</Bold>: 适用于纯 SOCKS5 代理，某些情况下可能遇到 SSL 握手问题
+                                    <Bold>SOCKS5</Bold>: 真正的 SOCKS5 协议。请填写代理软件的 SOCKS5 端口或 Mixed 端口；纯 HTTP 端口不能选 SOCKS5。
                                 </TextBlock>
-                                <TextBlock TextWrapping="Wrap" 
+                                <TextBlock TextWrapping="Wrap"
                                            Foreground="{ThemeResource SystemAccentColor}"
                                            FontWeight="SemiBold">
-                                    💡 如果不确定，请优先选择 HTTP
+                                    浏览器登录页使用浏览器/系统自己的代理设置，这里的代理只作用于本应用的网络请求。
                                 </TextBlock>
                             </StackPanel>
                         </InfoBar.Content>

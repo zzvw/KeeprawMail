@@ -1,4 +1,5 @@
 using KeeprawMail.Models;
+using KeeprawMail.Core.Networking;
 using MailKit;
 using MailKit.Net.Imap;
 using MailKit.Security;
@@ -34,114 +35,32 @@ namespace KeeprawMail.Services
         }
 
         /// <summary>
-        /// 设置代理
-        /// </summary>
-        /// <param name="type">代理类型 (SOCKS5, HTTP)</param>
-        /// <param name="host">主机地址</param>
-        /// <param name="port">端口</param>
-        public void SetProxy(string type, string host, int port)
-        {
-            if (string.IsNullOrEmpty(host)) return;
-
-            // 严格按照用户选择的代理类型设置，不再自动切换
-            // 用户应该根据代理软件的实际支持情况选择正确的类型
-            if (type.Equals("SOCKS5", StringComparison.OrdinalIgnoreCase))
-            {
-                System.Diagnostics.Debug.WriteLine($"[ImapService] Setting SOCKS5 proxy: {host}:{port}");
-                _client.ProxyClient = new MailKit.Net.Proxy.Socks5Client(host, port);
-            }
-            else if (type.Equals("SOCKS4", StringComparison.OrdinalIgnoreCase))
-            {
-                System.Diagnostics.Debug.WriteLine($"[ImapService] Setting SOCKS4 proxy: {host}:{port}");
-                _client.ProxyClient = new MailKit.Net.Proxy.Socks4Client(host, port);
-            }
-            else if (type.Equals("SOCKS4A", StringComparison.OrdinalIgnoreCase))
-            {
-                System.Diagnostics.Debug.WriteLine($"[ImapService] Setting SOCKS4A proxy: {host}:{port}");
-                _client.ProxyClient = new MailKit.Net.Proxy.Socks4aClient(host, port);
-            }
-            else if (type.Equals("HTTP", StringComparison.OrdinalIgnoreCase))
-            {
-                System.Diagnostics.Debug.WriteLine($"[ImapService] Setting HTTP proxy: {host}:{port}");
-                _client.ProxyClient = new MailKit.Net.Proxy.HttpProxyClient(host, port);
-            }
-            else
-            {
-                System.Diagnostics.Debug.WriteLine($"[ImapService] Unknown proxy type '{type}', ignoring proxy settings");
-            }
-        }
-
-        /// <summary>
-        /// 连接到 IMAP 服务器
+        /// 连接到 IMAP 服务器并认证。
+        /// 代理由 ProxyResolver 统一解析（全局 / 继承 / 直连 / 覆盖），
+        /// OAuth Token 由 TokenManager 统一提供与刷新，本类不再自行刷新。
         /// </summary>
         /// <param name="account">账号配置信息</param>
-        public async Task ConnectAsync(AccountProfile account)
+        public async Task ConnectAsync(AccountProfile account, CancellationToken cancellationToken = default)
         {
             if (_client.IsConnected)
-                await _client.DisconnectAsync(true);
+                await _client.DisconnectAsync(true, cancellationToken);
 
             _accountId = account.Id;
 
-            // 优化：禁用证书吊销检查以提升连接速度（不影响安全性）
-            _client.CheckCertificateRevocation = false;
+            // 1. 代理 + TLS 策略（恢复证书吊销检查，见 TlsPolicy）
+            var proxy = await AppServices.ResolveProxyAsync(account);
+            NetworkClientFactory.ConfigureMailClient(_client, proxy);
+            System.Diagnostics.Debug.WriteLine($"[ImapService] {account.Email} via {proxy}");
 
-            // 1. 配置代理
-            if (!string.IsNullOrEmpty(account.ProxyType) && account.ProxyType != "NONE")
-            {
-                System.Diagnostics.Debug.WriteLine($"[ImapService] Setting proxy for {account.Email}: {account.ProxyType}://{account.ProxyHost}:{account.ProxyPort}");
-                SetProxy(account.ProxyType, account.ProxyHost, account.ProxyPort);
-            }
-            else
-            {
-                _client.ProxyClient = null;
-            }
-
-            // 2. 连接
-            System.Diagnostics.Debug.WriteLine($"[ImapService] Attempting to connect to {account.ImapServer}:{account.ImapPort}...");
-            
-            // 对于 993 端口（隐式 SSL），使用 SslOnConnect
-            // 对于其他端口，使用 StartTls（显式 TLS）
-            var sslOptions = account.ImapPort == 993 
-                ? SecureSocketOptions.SslOnConnect 
+            // 2. 连接：993 隐式 TLS；其它端口强制 STARTTLS
+            var sslOptions = account.ImapPort == 993
+                ? SecureSocketOptions.SslOnConnect
                 : SecureSocketOptions.StartTls;
-            
-            await _client.ConnectAsync(account.ImapServer, account.ImapPort, sslOptions);
-            System.Diagnostics.Debug.WriteLine($"[ImapService] ✓ Successfully connected to {account.ImapServer}");
 
-            // 3. 认证
-            if (!string.IsNullOrEmpty(account.OAuthToken))
-            {
-                // 检查 Token 是否过期 (提前 5 分钟刷新)
-                // 注意：为了稳健性，如果连接失败提示 invalid_grant，通常也需要刷新，但这里先只按时间判断
-                if (account.TokenExpiration < DateTimeOffset.Now.AddMinutes(5) && !string.IsNullOrEmpty(account.RefreshToken))
-                {
-                    try
-                    {
-                        var oauthService = new OAuthService();
-                        var (newAccessToken, expiresIn) = await oauthService.RefreshAccessTokenAsync(
-                            account.RefreshToken, 
-                            account.ProxyType,
-                            account.ProxyType == "NONE" ? "" : account.ProxyHost, 
-                            account.ProxyPort);
-                        
-                        // 更新内存中的账号信息
-                        account.OAuthToken = newAccessToken;
-                        account.TokenExpiration = DateTimeOffset.Now.AddSeconds(expiresIn);
-                    }
-                    catch (Exception ex)
-                    {
-                        System.Diagnostics.Debug.WriteLine($"Token Refresh Failed: {ex.Message}");
-                    }
-                }
+            await _client.ConnectAsync(account.ImapServer, account.ImapPort, sslOptions, cancellationToken);
 
-                var oauth2 = new SaslMechanismOAuth2(account.Email, account.OAuthToken);
-                await _client.AuthenticateAsync(oauth2);
-            }
-            else
-            {
-                // 传统密码认证
-                await _client.AuthenticateAsync(account.Email, account.Password);
-            }
+            // 3. 认证（OAuth 或密码）
+            await AppServices.AuthenticateAsync(_client, account, proxy, cancellationToken);
         }
 
         /// <summary>

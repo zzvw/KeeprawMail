@@ -113,11 +113,23 @@ namespace KeeprawMail.Services
         }
 
         /// <summary>
+        /// 获取全局代理（领域模型），供 ProxyResolver 使用。
+        /// </summary>
+        public async Task<KeeprawMail.Core.Networking.ProxySettings> GetProxySettingsAsync()
+        {
+            var c = await GetGlobalProxyAsync();
+            return KeeprawMail.Core.Networking.ProxySettings.FromStored(c.Type, c.Host, c.Port);
+        }
+
+        /// <summary>
         /// 保存全局代理配置
         /// </summary>
         /// <param name="proxy">代理配置对象</param>
         public async Task SaveGlobalProxyAsync(ProxyConfig proxy)
         {
+            // 保存前校验，非法配置直接拒绝（不再静默当作直连）
+            KeeprawMail.Core.Networking.ProxySettings.FromStored(proxy.Type, proxy.Host, proxy.Port).Global.Validate();
+
             await _dbContext.SaveSettingAsync(GlobalProxyTypeKey, proxy.Type);
             await _dbContext.SaveSettingAsync(GlobalProxyHostKey, proxy.Host);
             await _dbContext.SaveSettingAsync(GlobalProxyPortKey, proxy.Port.ToString());

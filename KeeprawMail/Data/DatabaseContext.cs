@@ -1,3 +1,6 @@
+using KeeprawMail.Core.Auth;
+using KeeprawMail.Core.Security;
+using KeeprawMail.Core.Storage;
 using Microsoft.Data.Sqlite;
 using System;
 using System.IO;
@@ -9,14 +12,21 @@ namespace KeeprawMail.Data
     /// 数据库上下文
     /// 负责 SQLite 数据库的初始化、连接和基础操作
     /// </summary>
-    /// <summary>
-    /// 数据库上下文
-    /// 负责 SQLite 数据库的初始化、连接和基础操作
-    /// </summary>
     public class DatabaseContext : IDisposable
     {
         private const string DbName = "keepraw.db";
         private string _dbPath = string.Empty;
+        private readonly ICredentialStore? _credentialStoreOverride;
+
+        /// <summary>
+        /// 凭据（密码 / OAuth Token）存储。数据库中只保存账号的非敏感信息。
+        /// </summary>
+        private ICredentialStore CredentialStore => _credentialStoreOverride ?? Services.AppServices.CredentialStore;
+
+        public DatabaseContext(ICredentialStore? credentialStore = null) : this()
+        {
+            _credentialStoreOverride = credentialStore;
+        }
 
         public DatabaseContext()
         {
@@ -42,6 +52,35 @@ namespace KeeprawMail.Data
         /// 创建表和 FTS5 虚拟表
         /// </summary>
         public async Task InitializeAsync()
+        {
+            await InitializeSchemaAsync();
+
+            // 8. 凭据迁移：把旧版明文密码 / Token 迁到 DPAPI 安全存储。
+            //    每个账号"写入 → 读回校验 → 再清明文"，失败的账号保持原样，下次启动重试。
+            try
+            {
+                var result = await new AccountCredentialMigrator(ConnectionString, CredentialStore).MigrateAsync();
+                System.Diagnostics.Debug.WriteLine(
+                    $"[DatabaseContext] Credential migration: migrated={result.Migrated}, alreadySecure={result.AlreadySecure}, failed={result.FailedAccountIds.Count}");
+            }
+            catch (Exception ex)
+            {
+                // 迁移失败不影响启动：旧账号仍可用明文兜底
+                System.Diagnostics.Debug.WriteLine($"[DatabaseContext] Credential migration skipped: {ex.GetType().Name}");
+            }
+        }
+
+        /// <summary>
+        /// 回滚凭据迁移（仅用于降级到旧版程序）：把安全存储中的凭据写回明文列。
+        /// 通过命令行参数 --rollback-credential-migration 触发。
+        /// </summary>
+        public async Task<int> RollbackCredentialMigrationAsync()
+        {
+            await InitializeSchemaAsync();
+            return await new AccountCredentialMigrator(ConnectionString, CredentialStore).RollbackAsync();
+        }
+
+        private async Task InitializeSchemaAsync()
         {
             using var connection = new SqliteConnection(ConnectionString);
             await connection.OpenAsync();
@@ -127,6 +166,7 @@ namespace KeeprawMail.Data
 
             // 7. 数据库迁移 (检查并添加新字段)
             await MigrateDatabaseAsync(connection);
+            await AccountCredentialMigrator.EnsureSchemaAsync(connection);
         }
 
         private async Task MigrateDatabaseAsync(SqliteConnection connection)
@@ -297,17 +337,36 @@ namespace KeeprawMail.Data
         }
 
         /// <summary>
-        /// 保存账号到数据库
+        /// 保存账号。
+        /// 顺序：先把密码 / OAuth Token 写入安全存储，成功后再写数据库行（敏感列始终为空）。
+        /// 只写入非空的凭据：编辑代理等操作不会误删已保存的凭据。
         /// </summary>
         public async Task SaveAccountAsync(Models.AccountProfile account)
         {
+            // 1. 凭据 → 安全存储
+            if (!string.IsNullOrEmpty(account.Password))
+            {
+                await CredentialStore.SetAsync(CredentialKeys.Password(account.Id), account.Password);
+            }
+
+            if (!string.IsNullOrEmpty(account.RefreshToken))
+            {
+                account.AuthType = AccountAuthTypes.OAuth2;
+                var tokens = new OAuthTokenSet(account.RefreshToken!, account.OAuthToken, account.TokenExpiration);
+                await Services.AppServices.Tokens.SaveAsync(account.Id, tokens);
+                // 交给 TokenManager 之后，内存中不再保留
+                account.OAuthToken = null;
+                account.RefreshToken = null;
+            }
+
+            // 2. 非敏感信息 → 数据库
             using var connection = GetConnection();
             await connection.OpenAsync();
 
             var command = connection.CreateCommand();
             command.CommandText = @"
-                INSERT OR REPLACE INTO Accounts (Id, Email, Provider, ImapServer, ImapPort, SmtpServer, SmtpPort, Password, OAuthToken, RefreshToken, TokenExpiration, ProxyType, ProxyHost, ProxyPort)
-                VALUES ($Id, $Email, $Provider, $ImapServer, $ImapPort, $SmtpServer, $SmtpPort, $Password, $OAuthToken, $RefreshToken, $TokenExpiration, $ProxyType, $ProxyHost, $ProxyPort)";
+                INSERT OR REPLACE INTO Accounts (Id, Email, Provider, ImapServer, ImapPort, SmtpServer, SmtpPort, Password, OAuthToken, RefreshToken, TokenExpiration, ProxyType, ProxyHost, ProxyPort, CredentialVersion, AuthType)
+                VALUES ($Id, $Email, $Provider, $ImapServer, $ImapPort, $SmtpServer, $SmtpPort, '', '', '', $TokenExpiration, $ProxyType, $ProxyHost, $ProxyPort, $CredentialVersion, $AuthType)";
 
             command.Parameters.AddWithValue("$Id", account.Id);
             command.Parameters.AddWithValue("$Email", account.Email);
@@ -316,19 +375,21 @@ namespace KeeprawMail.Data
             command.Parameters.AddWithValue("$ImapPort", account.ImapPort);
             command.Parameters.AddWithValue("$SmtpServer", account.SmtpServer);
             command.Parameters.AddWithValue("$SmtpPort", account.SmtpPort);
-            command.Parameters.AddWithValue("$Password", account.Password);
-            command.Parameters.AddWithValue("$OAuthToken", account.OAuthToken ?? "");
-            command.Parameters.AddWithValue("$RefreshToken", account.RefreshToken ?? "");
-            command.Parameters.AddWithValue("$TokenExpiration", account.TokenExpiration.ToString("o"));
+            command.Parameters.AddWithValue("$TokenExpiration", DateTimeOffset.MinValue.ToString("o"));
             command.Parameters.AddWithValue("$ProxyType", account.ProxyType);
             command.Parameters.AddWithValue("$ProxyHost", account.ProxyHost);
             command.Parameters.AddWithValue("$ProxyPort", account.ProxyPort);
+            command.Parameters.AddWithValue("$CredentialVersion", AccountCredentialMigrator.SecureVersion);
+            command.Parameters.AddWithValue("$AuthType", account.AuthType);
 
             await command.ExecuteNonQueryAsync();
+            account.CredentialVersion = AccountCredentialMigrator.SecureVersion;
         }
 
         /// <summary>
-        /// 获取所有账号
+        /// 获取所有账号。
+        /// CredentialVersion = 1：密码从安全存储读取；OAuth Token 不加载（运行时由 TokenManager 提供）。
+        /// CredentialVersion = 0：迁移尚未成功的旧账号，暂用数据库中的明文兜底。
         /// </summary>
         public async Task<System.Collections.Generic.List<Models.AccountProfile>> GetAccountsAsync()
         {
@@ -338,28 +399,68 @@ namespace KeeprawMail.Data
             await connection.OpenAsync();
 
             var command = connection.CreateCommand();
-            command.CommandText = "SELECT * FROM Accounts";
+            command.CommandText = @"
+                SELECT Id, Email, Provider, ImapServer, ImapPort, SmtpServer, SmtpPort,
+                       Password, OAuthToken, RefreshToken, TokenExpiration,
+                       ProxyType, ProxyHost, ProxyPort,
+                       IFNULL(CredentialVersion, 0), AuthType
+                FROM Accounts";
 
-            using var reader = await command.ExecuteReaderAsync();
-            while (await reader.ReadAsync())
+            using (var reader = await command.ExecuteReaderAsync())
             {
-                results.Add(new Models.AccountProfile
+                while (await reader.ReadAsync())
                 {
-                    Id = reader.GetString(0),
-                    Email = reader.GetString(1),
-                    Provider = (Models.EmailProvider)reader.GetInt32(2),
-                    ImapServer = reader.IsDBNull(3) ? "" : reader.GetString(3),
-                    ImapPort = reader.IsDBNull(4) ? 993 : reader.GetInt32(4),
-                    SmtpServer = reader.IsDBNull(5) ? "" : reader.GetString(5),
-                    SmtpPort = reader.IsDBNull(6) ? 465 : reader.GetInt32(6),
-                    Password = reader.IsDBNull(7) ? "" : reader.GetString(7),
-                    OAuthToken = reader.IsDBNull(8) ? null : reader.GetString(8),
-                    RefreshToken = reader.IsDBNull(9) ? null : reader.GetString(9),
-                    TokenExpiration = reader.IsDBNull(10) ? DateTimeOffset.MinValue : DateTimeOffset.Parse(reader.GetString(10)),
-                    ProxyType = reader.IsDBNull(11) ? "NONE" : reader.GetString(11),
-                    ProxyHost = reader.IsDBNull(12) ? "" : reader.GetString(12),
-                    ProxyPort = reader.IsDBNull(13) ? 0 : reader.GetInt32(13)
-                });
+                    var version = reader.GetInt32(14);
+                    var legacyPassword = reader.IsDBNull(7) ? "" : reader.GetString(7);
+                    var legacyAccess = reader.IsDBNull(8) ? "" : reader.GetString(8);
+                    var legacyRefresh = reader.IsDBNull(9) ? "" : reader.GetString(9);
+                    var authType = reader.IsDBNull(15) || string.IsNullOrEmpty(reader.GetString(15))
+                        ? (legacyRefresh.Length > 0 || legacyAccess.Length > 0 ? AccountAuthTypes.OAuth2 : AccountAuthTypes.Password)
+                        : reader.GetString(15);
+
+                    var account = new Models.AccountProfile
+                    {
+                        Id = reader.GetString(0),
+                        Email = reader.GetString(1),
+                        Provider = (Models.EmailProvider)reader.GetInt32(2),
+                        ImapServer = reader.IsDBNull(3) ? "" : reader.GetString(3),
+                        ImapPort = reader.IsDBNull(4) ? 993 : reader.GetInt32(4),
+                        SmtpServer = reader.IsDBNull(5) ? "" : reader.GetString(5),
+                        SmtpPort = reader.IsDBNull(6) ? 465 : reader.GetInt32(6),
+                        ProxyType = reader.IsDBNull(11) ? "GLOBAL" : reader.GetString(11),
+                        ProxyHost = reader.IsDBNull(12) ? "" : reader.GetString(12),
+                        ProxyPort = reader.IsDBNull(13) ? 0 : reader.GetInt32(13),
+                        CredentialVersion = version,
+                        AuthType = authType,
+                    };
+
+                    if (version == AccountCredentialMigrator.LegacyVersion)
+                    {
+                        account.Password = legacyPassword;
+                        account.OAuthToken = legacyAccess.Length > 0 ? legacyAccess : null;
+                        account.RefreshToken = legacyRefresh.Length > 0 ? legacyRefresh : null;
+                        account.TokenExpiration = reader.IsDBNull(10) || !DateTimeOffset.TryParse(reader.GetString(10), out var exp)
+                            ? DateTimeOffset.MinValue : exp;
+                    }
+
+                    results.Add(account);
+                }
+            }
+
+            foreach (var account in results)
+            {
+                if (account.CredentialVersion == AccountCredentialMigrator.SecureVersion && !account.IsOAuth)
+                {
+                    try
+                    {
+                        account.Password = await CredentialStore.GetAsync(CredentialKeys.Password(account.Id)) ?? "";
+                    }
+                    catch (Exception ex)
+                    {
+                        // 例如换了 Windows 用户 / 重装系统导致 DPAPI 无法解密：账号保留，认证时提示重新输入
+                        System.Diagnostics.Debug.WriteLine($"[DatabaseContext] Cannot read credential for account {account.Id}: {ex.GetType().Name}");
+                    }
+                }
             }
 
             return results;
@@ -378,6 +479,33 @@ namespace KeeprawMail.Data
             command.Parameters.AddWithValue("$Id", accountId);
 
             await command.ExecuteNonQueryAsync();
+
+            await DeleteCredentialsAsync(accountId);
+        }
+
+        /// <summary>删除账号在安全存储中的全部凭据。</summary>
+        private async Task DeleteCredentialsAsync(string accountId)
+        {
+            try
+            {
+                await CredentialStore.DeleteAsync(CredentialKeys.Password(accountId));
+                await Services.AppServices.Tokens.DeleteAsync(accountId);
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"[DatabaseContext] Delete credentials failed for {accountId}: {ex.GetType().Name}");
+            }
+        }
+
+        private async Task<System.Collections.Generic.List<string>> QueryIdsAsync(SqliteConnection connection, string sql)
+        {
+            var ids = new System.Collections.Generic.List<string>();
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = sql;
+            using var reader = await cmd.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+                ids.Add(reader.GetString(0));
+            return ids;
         }
 
         /// <summary>
@@ -397,6 +525,10 @@ namespace KeeprawMail.Data
             using var connection = GetConnection();
             await connection.OpenAsync();
 
+            var duplicateIds = await QueryIdsAsync(connection, @"
+                SELECT Id FROM Accounts
+                WHERE rowid NOT IN (SELECT MAX(rowid) FROM Accounts GROUP BY Email)");
+
             var command = connection.CreateCommand();
             command.CommandText = @"
                 DELETE FROM Accounts 
@@ -407,6 +539,9 @@ namespace KeeprawMail.Data
                 )";
             
             await command.ExecuteNonQueryAsync();
+
+            foreach (var id in duplicateIds)
+                await DeleteCredentialsAsync(id);
         }
 
         /// <summary>
@@ -437,6 +572,8 @@ namespace KeeprawMail.Data
             using var connection = GetConnection();
             await connection.OpenAsync();
 
+            var accountIds = await QueryIdsAsync(connection, "SELECT Id FROM Accounts");
+
             using var transaction = connection.BeginTransaction();
             
             var command = connection.CreateCommand();
@@ -449,6 +586,9 @@ namespace KeeprawMail.Data
             await command.ExecuteNonQueryAsync();
             
             await transaction.CommitAsync();
+
+            foreach (var id in accountIds)
+                await DeleteCredentialsAsync(id);
         }
         /// <summary>
         /// 更新邮件已读状态

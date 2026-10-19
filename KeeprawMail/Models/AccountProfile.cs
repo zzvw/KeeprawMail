@@ -59,30 +59,44 @@ namespace KeeprawMail.Models
         public int SmtpPort { get; set; } = 465;
 
         /// <summary>
-        /// 密码或授权码 (注意：生产环境应使用 Windows Credential Locker 加密存储)
-        /// 这里为了 MVP 简化，暂时明文存储，后续需改进
+        /// 密码或授权码（仅在内存中）。
+        /// 持久化在 DPAPI(CurrentUser) 加密的凭据存储中，数据库里不再保存明文。
         /// </summary>
         public string Password { get; set; } = string.Empty;
 
         /// <summary>
-        /// OAuth 令牌 (如果支持 OAuth)
+        /// 认证方式："PASSWORD" 或 "OAUTH2"（见 KeeprawMail.Core.Storage.AccountAuthTypes）。
+        /// </summary>
+        public string AuthType { get; set; } = KeeprawMail.Core.Storage.AccountAuthTypes.Password;
+
+        /// <summary>是否 OAuth 账号。</summary>
+        public bool IsOAuth => AuthType == KeeprawMail.Core.Storage.AccountAuthTypes.OAuth2;
+
+        /// <summary>
+        /// 凭据存储版本：0 = 旧版明文（迁移失败时的兜底），1 = 安全存储。
+        /// </summary>
+        public int CredentialVersion { get; set; }
+
+        /// <summary>
+        /// OAuth Access Token —— 仅用于"登录成功 → 保存账号"之间的传递，
+        /// 保存时写入安全存储；从数据库读取账号时不会填充（运行时一律向 TokenManager 获取）。
         /// </summary>
         public string? OAuthToken { get; set; }
 
         /// <summary>
-        /// OAuth 刷新令牌 (用于获取新的 Access Token)
+        /// OAuth Refresh Token —— 同上，仅用于传递，持久化在安全存储中。
         /// </summary>
         public string? RefreshToken { get; set; }
 
         /// <summary>
-        /// 令牌过期时间
+        /// Access Token 过期时间 —— 同上，仅用于传递。
         /// </summary>
         public System.DateTimeOffset TokenExpiration { get; set; }
 
         /// <summary>
-        /// 代理类型 ("NONE", "HTTP", "SOCKS5")
+        /// 代理类型："GLOBAL"（继承全局，默认）、"NONE"（强制直连）、"HTTP"、"SOCKS5"（覆盖全局）。
         /// </summary>
-        public string ProxyType { get; set; } = "NONE";
+        public string ProxyType { get; set; } = "GLOBAL";
 
         /// <summary>
         /// 代理服务器地址

@@ -185,7 +185,7 @@ namespace KeeprawMail.Views
                 await App.SettingsService.SaveGlobalProxyAsync(proxyConfig);
 
                 // 显示成功提示
-                await ShowSuccessDialog("保存成功", "全局代理设置已保存，新添加的账号将使用此配置");
+                await ShowSuccessDialog("保存成功", "全局代理设置已保存，所有选择“Use Global Settings”的账号会立即使用此配置");
 
                 System.Diagnostics.Debug.WriteLine($"全局代理已保存: {proxyType} {proxyConfig.Host}:{proxyConfig.Port}");
             }
@@ -264,6 +264,7 @@ namespace KeeprawMail.Views
                         Header = "Proxy Type",
                         HorizontalAlignment = HorizontalAlignment.Stretch
                     };
+                    proxyTypeCombo.Items.Add(new ComboBoxItem { Content = "Use Global Settings", Tag = "GLOBAL" });
                     proxyTypeCombo.Items.Add(new ComboBoxItem { Content = "None (Direct Connection)", Tag = "NONE" });
                     proxyTypeCombo.Items.Add(new ComboBoxItem { Content = "HTTP", Tag = "HTTP" });
                     proxyTypeCombo.Items.Add(new ComboBoxItem { Content = "SOCKS5", Tag = "SOCKS5" });
@@ -288,7 +289,7 @@ namespace KeeprawMail.Views
                     var proxyPortBox = new NumberBox
                     {
                         Header = "Proxy Port",
-                        Value = account.ProxyPort,
+                        Value = account.ProxyPort > 0 ? account.ProxyPort : 7890,
                         Minimum = 1,
                         Maximum = 65535,
                         SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Inline
@@ -297,7 +298,8 @@ namespace KeeprawMail.Views
                     // 根据代理类型启用/禁用输入框
                     void UpdateInputState()
                     {
-                        var isEnabled = proxyTypeCombo.SelectedItem is ComboBoxItem item && item.Tag?.ToString() != "NONE";
+                        var tag = (proxyTypeCombo.SelectedItem as ComboBoxItem)?.Tag?.ToString();
+                        var isEnabled = tag == "HTTP" || tag == "SOCKS5";
                         proxyHostBox.IsEnabled = isEnabled;
                         proxyPortBox.IsEnabled = isEnabled;
                     }
@@ -316,20 +318,28 @@ namespace KeeprawMail.Views
                     if (result == ContentDialogResult.Primary)
                     {
                         var selectedItem = proxyTypeCombo.SelectedItem as ComboBoxItem;
-                        var newProxyType = selectedItem?.Tag?.ToString() ?? "NONE";
+                        var newProxyType = selectedItem?.Tag?.ToString() ?? "GLOBAL";
                         var newProxyHost = proxyHostBox.Text.Trim();
                         var newProxyPort = (int)proxyPortBox.Value;
 
-                        // 验证输入
-                        if (newProxyType != "NONE")
+                        // 验证输入（HTTP / SOCKS5 必须有合法主机和端口）
+                        if (newProxyType == "HTTP" || newProxyType == "SOCKS5")
                         {
-                            if (string.IsNullOrWhiteSpace(newProxyHost))
+                            try
                             {
-                                await ShowErrorDialog("验证失败", "代理主机不能为空");
-                                // 理想情况下应该阻止对话框关闭，或者重新打开对话框
-                                // 这里简单处理：不保存，用户需要重新操作
+                                KeeprawMail.Core.Networking.AccountProxySettings
+                                    .FromStored(newProxyType, newProxyHost, newProxyPort).Override!.Validate();
+                            }
+                            catch (KeeprawMail.Core.Networking.ProxyConfigurationException ex)
+                            {
+                                await ShowErrorDialog("验证失败", ex.Message);
                                 return;
                             }
+                        }
+                        else
+                        {
+                            newProxyHost = string.Empty;
+                            newProxyPort = 0;
                         }
 
                         // 更新账号代理设置
