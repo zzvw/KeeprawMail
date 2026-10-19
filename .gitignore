@@ -118,6 +118,12 @@ Desktop.ini
 *.p12
 *.key
 
+# OAuth credentials — never commit (see docs/HowToGetGmailClientId.md)
+oauth.credentials.json
+appsettings.local.json
+appsettings.*.local.json
+secrets.json
+
 # ==========================================================================
 # One-off scratch scripts (root level debugging helpers)
 # ==========================================================================

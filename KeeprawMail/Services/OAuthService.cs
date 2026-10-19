@@ -15,11 +15,6 @@ namespace KeeprawMail.Services
     /// </summary>
     public class OAuthService
     {
-        // Gmail Client ID (由用户提供)
-        private const string GmailClientId = "REDACTED_CLIENT_ID";
-        // Gmail Client Secret (桌面应用通常不需要，或者使用空字符串)
-        private const string GmailClientSecret = "REDACTED_CLIENT_SECRET"; // 用户提供的 Secret
-        
         private const string GoogleAuthEndpoint = "https://accounts.google.com/o/oauth2/v2/auth";
         private const string GoogleTokenEndpoint = "https://oauth2.googleapis.com/token";
 
@@ -31,6 +26,8 @@ namespace KeeprawMail.Services
         /// </summary>
         public async Task<(string AccessToken, string RefreshToken, DateTimeOffset Expiration, string Email)> LoginGmailAsync(string proxyType = "NONE", string proxyHost = "", int proxyPort = 0)
         {
+            OAuthCredentials.EnsureConfigured();
+
             // 1. 获取一个随机的本地端口用于回调
             var port = GetRandomUnusedPort();
             var redirectUri = $"http://127.0.0.1:{port}/";
@@ -42,7 +39,7 @@ namespace KeeprawMail.Services
 
             // 3. 构建认证 URL
             var authUrl = $"{GoogleAuthEndpoint}?" +
-                          $"client_id={GmailClientId}&" +
+                          $"client_id={OAuthCredentials.ClientId}&" +
                           $"redirect_uri={Uri.EscapeDataString(redirectUri)}&" +
                           $"response_type=code&" +
                           $"scope={Uri.EscapeDataString(Scopes)}&" +
@@ -90,12 +87,18 @@ namespace KeeprawMail.Services
             {
                 var values = new Dictionary<string, string>
                 {
-                    { "client_id", GmailClientId },
-                    { "client_secret", GmailClientSecret },
+                    { "client_id", OAuthCredentials.ClientId },
                     { "code", code },
                     { "redirect_uri", redirectUri },
                     { "grant_type", "authorization_code" }
                 };
+
+                // 桌面应用可不使用 client secret，仅在已配置时才发送该参数
+                var clientSecret = OAuthCredentials.ClientSecret;
+                if (clientSecret.Length > 0)
+                {
+                    values.Add("client_secret", clientSecret);
+                }
 
                 var content = new FormUrlEncodedContent(values);
                 var response = await client.PostAsync(GoogleTokenEndpoint, content);
@@ -146,11 +149,17 @@ namespace KeeprawMail.Services
             {
                 var values = new Dictionary<string, string>
                 {
-                    { "client_id", GmailClientId },
-                    { "client_secret", GmailClientSecret },
+                    { "client_id", OAuthCredentials.ClientId },
                     { "refresh_token", refreshToken },
                     { "grant_type", "refresh_token" }
                 };
+
+                // 桌面应用可不使用 client secret，仅在已配置时才发送该参数
+                var clientSecret = OAuthCredentials.ClientSecret;
+                if (clientSecret.Length > 0)
+                {
+                    values.Add("client_secret", clientSecret);
+                }
 
                 var content = new FormUrlEncodedContent(values);
                 var response = await client.PostAsync(GoogleTokenEndpoint, content);

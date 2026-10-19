@@ -41,8 +41,41 @@
     *   复制 **客户端 ID** (Client ID)。
     *   客户端密钥 (Client Secret) 对于桌面应用不是必须保密的，但在 Keepraw Mail 中我们主要使用 Client ID。
 
-## 步骤 5：在 Keepraw Mail 中使用
+## 步骤 5：在 Keepraw Mail 中配置
 
-1.  打开 Keepraw Mail 设置（未来版本支持）。
-2.  将您的 Client ID 填入相应位置。
-3.  现在您可以使用 "Sign in with Google" 登录了！
+**凭据不会写进源码，也不会提交到版本库**（否则会触发 GitHub Secret Scanning 拦截推送）。
+请用下面任意一种方式配置：
+
+### 方式一：本地凭据文件（推荐）
+
+创建文件 `%LOCALAPPDATA%\KeeprawMail\oauth.credentials.json`：
+
+```json
+{
+  "clientId": "你的客户端 ID.apps.googleusercontent.com",
+  "clientSecret": "你的客户端密钥"
+}
+```
+
+此文件位于仓库之外，不会被 git 跟踪。
+
+### 方式二：环境变量
+
+```powershell
+$env:KEEPRAWMAIL_GOOGLE_CLIENT_ID = "你的客户端 ID.apps.googleusercontent.com"
+$env:KEEPRAWMAIL_GOOGLE_CLIENT_SECRET = "你的客户端密钥"
+```
+
+环境变量优先级高于凭据文件，适合 CI / 打包流水线。
+
+### 客户端密钥可以留空
+
+桌面应用（Desktop app）类型的客户端通常不需要 client secret，此时省略 `clientSecret`
+字段即可，程序会自动跳过该参数。
+
+配置完成后，重新编译并运行 Keepraw Mail，即可使用 "Sign in with Google" 登录。
+
+> **安全提示**：Client ID / Client Secret 一旦出现在提交记录中就应视为已泄露。
+> 如果你之前把它们提交到了公开仓库，请立刻在
+> [Google Cloud Console](https://console.cloud.google.com/apis/credentials) 中
+> **删除并重新创建**这组凭据。
