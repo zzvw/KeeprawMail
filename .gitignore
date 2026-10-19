@@ -1,0 +1,40 @@
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# .NET build outputs
+[Bb]in/
+[Oo]bj/
+
+# Build artifacts
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+
+# NuGet
+*.nupkg
+packages/
+
+# Test results
+TestResults/
+*.trx
+
+# Local logs
+*.log
+logs/
+
+# Runtime database files
+*.db-wal
+*.db-shm
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+
+# WebView2 Fixed Version Runtime
+Microsoft.WebView2.FixedVersionRuntime*
