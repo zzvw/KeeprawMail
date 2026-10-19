@@ -53,6 +53,11 @@
                             </StackPanel>
                             
                             <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8">
+                                <Button Content="Re-authorize"
+                                        ToolTipService.ToolTip="Google 授权失效时，在浏览器中重新授权此账号（账号与本地邮件保留）"
+                                        Visibility="{x:Bind IsOAuth}"
+                                        Click="ReauthorizeAccount_Click"
+                                        Tag="{x:Bind Id}"/>
                                 <Button Content="Edit Proxy" 
                                         Click="EditAccountProxy_Click"
                                         Tag="{x:Bind Id}"/>

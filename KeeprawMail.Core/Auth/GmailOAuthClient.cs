@@ -19,6 +19,12 @@ public interface ITokenRefresher
     Task<TokenRefreshResult> RefreshAsync(string refreshToken, ProxyEndpoint proxy, CancellationToken cancellationToken);
 }
 
+/// <summary>交互式（浏览器）OAuth 登录抽象。</summary>
+public interface IInteractiveOAuthLogin
+{
+    Task<GmailLoginResult> LoginAsync(ProxyEndpoint proxy, string? loginHint = null, CancellationToken cancellationToken = default);
+}
+
 /// <summary>
 /// Gmail OAuth 2.0（已安装应用 + 回环重定向 + PKCE S256）。
 ///
@@ -30,7 +36,7 @@ public interface ITokenRefresher
 ///     支持超时与 CancellationToken；
 ///  5. 经由账号的生效代理，用 code + code_verifier 换 Token，并请求 UserInfo 取邮箱。
 /// </summary>
-public sealed class GmailOAuthClient : ITokenRefresher
+public sealed class GmailOAuthClient : ITokenRefresher, IInteractiveOAuthLogin
 {
     private readonly GmailOAuthOptions _options;
     private readonly Func<ProxyEndpoint, HttpClient> _httpClientFactory;

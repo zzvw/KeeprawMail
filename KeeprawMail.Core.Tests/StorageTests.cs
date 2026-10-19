@@ -45,13 +45,27 @@ public class ProtectedFileCredentialStoreTests : IDisposable
         Assert.Single(Directory.GetFiles(_dir));
     }
 
-    [Fact]
-    public void Dpapi_RoundTrip_OnWindows()
+    /// <summary>
+    /// 真实 DPAPI(CurrentUser) 往返。非 Windows 平台显示为 Skipped（而不是假装 Passed），
+    /// Windows CI 会检查 TRX 确认本测试结果为 Passed。
+    /// </summary>
+    [SkippableFact]
+    public async Task Dpapi_RoundTrip_OnWindows()
     {
-        if (!OperatingSystem.IsWindows()) return; // 仅在 Windows 上可运行
+        Skip.IfNot(OperatingSystem.IsWindows(), "DPAPI 仅在 Windows 上可用");
+#pragma warning disable CA1416
         var p = new DpapiSecretProtector();
         var c = p.Protect(Encoding.UTF8.GetBytes("hello"));
+        Assert.NotEqual("hello", Encoding.UTF8.GetString(c));
         Assert.Equal("hello", Encoding.UTF8.GetString(p.Unprotect(c)));
+
+        // 通过文件存储走一遍，确认落盘内容是 DPAPI 密文
+        var store = new ProtectedFileCredentialStore(_dir, p);
+        await store.SetAsync("k", "dpapi-secret-value");
+        Assert.Equal("dpapi-secret-value", await store.GetAsync("k"));
+        foreach (var f in Directory.GetFiles(_dir))
+            Assert.DoesNotContain("dpapi-secret-value", Encoding.UTF8.GetString(await File.ReadAllBytesAsync(f)));
+#pragma warning restore CA1416
     }
 }
 

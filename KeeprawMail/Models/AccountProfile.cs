@@ -78,6 +78,11 @@ namespace KeeprawMail.Models
         public int CredentialVersion { get; set; }
 
         /// <summary>
+        /// 已保存的密码无法解密（例如换了 Windows 用户或重装系统，DPAPI 无法解密）。
+        /// </summary>
+        public bool CredentialUnreadable { get; set; }
+
+        /// <summary>
         /// OAuth Access Token —— 仅用于"登录成功 → 保存账号"之间的传递，
         /// 保存时写入安全存储；从数据库读取账号时不会填充（运行时一律向 TokenManager 获取）。
         /// </summary>

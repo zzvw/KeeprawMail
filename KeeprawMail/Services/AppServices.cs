@@ -1,6 +1,7 @@
 using KeeprawMail.Core.Auth;
 using KeeprawMail.Core.Networking;
 using KeeprawMail.Core.Security;
+using KeeprawMail.Core.Storage;
 using KeeprawMail.Models;
 using System;
 using System.Diagnostics;
@@ -33,7 +34,7 @@ namespace KeeprawMail.Services
                 new SystemBrowserLauncher());
         });
 
-        private static readonly Lazy<TokenManager> LazyTokens = new(() => new TokenManager(CredentialStore, new LazyGmailRefresher()));
+        private static readonly Lazy<AccountSecretsService> LazySecrets = new(() => new AccountSecretsService(CredentialStore, new LazyGmailRefresher()));
 
         /// <summary>DPAPI(CurrentUser) 加密的凭据存储。</summary>
         public static ICredentialStore CredentialStore => LazyStore.Value;
@@ -43,8 +44,14 @@ namespace KeeprawMail.Services
         /// <summary>未配置 Client ID 时访问会抛出带操作指引的异常。</summary>
         public static GmailOAuthClient Gmail => LazyGmail.Value;
 
+        /// <summary>
+        /// 账号凭据服务（进程单例）：密码、OAuth Token、迁移、删除共用同一个存储；
+        /// 其中的 TokenManager 是全应用唯一的 Token 管理服务（按账号加锁、刷新去重）。
+        /// </summary>
+        public static AccountSecretsService Secrets => LazySecrets.Value;
+
         /// <summary>唯一的 Token 管理服务。</summary>
-        public static TokenManager Tokens => LazyTokens.Value;
+        public static TokenManager Tokens => Secrets.Tokens;
 
         /// <summary>
         /// 解析账号最终生效的代理（全局 + 账号继承/直连/覆盖）。
@@ -61,6 +68,17 @@ namespace KeeprawMail.Services
             return await settings.GetProxySettingsAsync();
         }
 
+        /// <summary>
+        /// 重新授权现有 Gmail 账号：浏览器登录 → 校验邮箱一致 → 新 Token 写入原 AccountId。
+        /// 账号 ID、代理设置、本地邮件与草稿均保持不变。
+        /// </summary>
+        public static async Task ReauthorizeGmailAsync(AccountProfile account, CancellationToken ct = default)
+        {
+            OAuthCredentials.EnsureConfigured();
+            var proxy = await ResolveProxyAsync(account);
+            await AccountReauthorizer.ReauthorizeAsync(Gmail, Tokens, account.Id, account.Email, proxy, ct);
+        }
+
         /// <summary>IMAP / SMTP 统一认证入口。</summary>
         public static async Task AuthenticateAsync(MailKit.IMailService client, AccountProfile account, ProxyEndpoint proxy, CancellationToken ct = default)
         {
@@ -72,6 +90,11 @@ namespace KeeprawMail.Services
                     await Tokens.SaveAsync(account.Id,
                         new OAuthTokenSet(account.RefreshToken!, account.OAuthToken, account.TokenExpiration), ct);
                 }
+            }
+            else if (account.CredentialUnreadable)
+            {
+                throw new MailKit.Security.AuthenticationException(
+                    $"账号 {account.Email} 保存的密码无法在当前 Windows 用户下解密（可能更换了用户或重装了系统）。请删除该账号后重新添加。");
             }
 
             await MailAuthenticator.AuthenticateAsync(client, Tokens, account.Id, account.Email, account.IsOAuth, account.Password, proxy, ct);

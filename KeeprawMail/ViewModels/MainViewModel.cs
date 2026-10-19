@@ -97,7 +97,7 @@ namespace KeeprawMail.ViewModels
                 }
                 
                 // 调试输出
-                StatusMessage = $"已加载 {Emails.Count} 封邮件到列表";
+                StatusMessage = Data.DatabaseContext.CredentialMigrationNotice ?? $"已加载 {Emails.Count} 封邮件到列表";
                 System.Diagnostics.Debug.WriteLine($"LoadLocalEmailsAsync: 加载了 {Emails.Count} 封邮件");
             }
             catch (System.Exception ex)

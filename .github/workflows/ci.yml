@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, "pr1/**" ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  # 公开 CI 不配置任何真实 Gmail OAuth 凭据；测试全部使用本地模拟服务。
+  KEEPRAWMAIL_GOOGLE_CLIENT_ID: ""
+  KEEPRAWMAIL_GOOGLE_CLIENT_SECRET: ""
+
+jobs:
+  core-linux:
+    name: Core tests (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+      - name: Test KeeprawMail.Core
+        run: >
+          dotnet test KeeprawMail.Core.Tests/KeeprawMail.Core.Tests.csproj -c Release
+          --logger "trx;LogFileName=core-linux.trx" --logger "console;verbosity=normal"
+          --results-directory TestResults
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-linux
+          path: TestResults/
+
+  windows:
+    name: Windows build, tests, Release/AOT publish
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+
+      - name: Tool versions
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force logs | Out-Null
+          dotnet --info > logs/dotnet-info.txt
+          & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Tee-Object -FilePath logs/vs-cpp-tools.txt
+
+      - name: Build KeeprawMail.Core
+        shell: pwsh
+        run: dotnet build KeeprawMail.Core/KeeprawMail.Core.csproj -c Release -warnaserror:IL2026,IL2046,IL2057,IL2067,IL2070,IL2072,IL2075,IL2087,IL2090,IL2091,IL3050,IL3051 2>&1 | Tee-Object -FilePath logs/core-build.log
+
+      - name: Test KeeprawMail.Core (Windows, includes real DPAPI)
+        shell: pwsh
+        run: |
+          dotnet test KeeprawMail.Core.Tests/KeeprawMail.Core.Tests.csproj -c Release `
+            --logger "trx;LogFileName=core-windows.trx" --logger "console;verbosity=normal" `
+            --results-directory TestResults 2>&1 | Tee-Object -FilePath logs/core-test.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify DPAPI test actually ran (not skipped)
+        shell: pwsh
+        run: |
+          [xml]$trx = Get-Content TestResults/core-windows.trx
+          $ns = @{ t = "http://microsoft.com/schemas/VisualStudio/TeamTest/2010" }
+          $r = Select-Xml -Xml $trx -Namespace $ns -XPath "//t:UnitTestResult[contains(@testName,'Dpapi_RoundTrip_OnWindows')]"
+          if (-not $r) { Write-Error "DPAPI test not found in TRX"; exit 1 }
+          $outcome = $r.Node.outcome
+          Write-Host "DPAPI test outcome: $outcome"
+          if ($outcome -ne "Passed") { Write-Error "DPAPI test outcome is '$outcome', expected Passed"; exit 1 }
+          $counters = (Select-Xml -Xml $trx -Namespace $ns -XPath "//t:Counters").Node
+          "total=$($counters.total) passed=$($counters.passed) failed=$($counters.failed) notExecuted=$($counters.notExecuted)" | Tee-Object -FilePath logs/test-summary.txt
+
+      - name: Publish WinUI app (Release, win-x64, Native AOT)
+        shell: pwsh
+        run: |
+          dotnet publish KeeprawMail/KeeprawMail.csproj -c Release -r win-x64 -p:Platform=x64 `
+            -p:PublishAot=true -p:WindowsAppSDKSelfContained=true `
+            -o artifacts/KeeprawMail-win-x64 -bl:logs/publish.binlog 2>&1 | Tee-Object -FilePath logs/publish.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify native AOT output
+        shell: pwsh
+        run: |
+          $exe = "artifacts/KeeprawMail-win-x64/KeeprawMail.exe"
+          if (-not (Test-Path $exe)) { Write-Error "KeeprawMail.exe not produced"; exit 1 }
+          # Native AOT 产物不应包含托管的 KeeprawMail.dll
+          if (Test-Path "artifacts/KeeprawMail-win-x64/KeeprawMail.dll") { Write-Error "Managed KeeprawMail.dll found: not a Native AOT publish"; exit 1 }
+          $size = (Get-Item $exe).Length
+          "KeeprawMail.exe size: $size bytes" | Tee-Object -FilePath logs/aot-output.txt
+          Get-ChildItem artifacts/KeeprawMail-win-x64 | Select-Object Name, Length | Format-Table | Out-String | Tee-Object -FilePath logs/aot-output.txt -Append
+          Select-String -Path logs/publish.log -Pattern "warning IL|warning AOT" | ForEach-Object { $_.Line } | Tee-Object -FilePath logs/aot-warnings.txt
+          "AOT/trim warnings: $((Get-Content logs/aot-warnings.txt -ErrorAction SilentlyContinue | Measure-Object -Line).Lines)" | Tee-Object -FilePath logs/aot-output.txt -Append
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs-windows
+          path: |
+            logs/
+            TestResults/
+
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: KeeprawMail-win-x64-aot
+          path: artifacts/KeeprawMail-win-x64/

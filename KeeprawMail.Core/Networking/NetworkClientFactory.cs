@@ -81,12 +81,13 @@ public sealed class NetworkClientFactory : IDisposable
     /// <summary>
     /// 配置 MailKit 客户端：代理 + TLS 校验策略（恢复吊销检查）。
     /// </summary>
-    public static void ConfigureMailClient(IMailService client, ProxyEndpoint endpoint)
+    public static void ConfigureMailClient(IMailService client, ProxyEndpoint endpoint, TlsValidationOptions? tls = null)
     {
         ArgumentNullException.ThrowIfNull(client);
         client.ProxyClient = CreateMailProxyClient(endpoint);
-        client.CheckCertificateRevocation = true;
-        client.ServerCertificateValidationCallback = TlsPolicy.ValidateServerCertificate;
+        // 默认：握手时按系统信任库在线检查吊销；自定义信任根（仅测试）时由回调自行构建链并检查吊销
+        client.CheckCertificateRevocation = tls?.CustomRoots is null;
+        client.ServerCertificateValidationCallback = TlsPolicy.CreateCallback(tls);
         client.Timeout = 60_000;
     }
 

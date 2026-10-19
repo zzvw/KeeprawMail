@@ -216,9 +216,25 @@ namespace KeeprawMail.Views
                     cancellationToken: _loginCts.Token);
 
                 var existingAccounts = await _dbContext.GetAccountsAsync();
-                if (existingAccounts.Any(a => a.Email.Equals(login.Email, StringComparison.OrdinalIgnoreCase)))
+                var existing = existingAccounts.FirstOrDefault(a => a.Email.Equals(login.Email, StringComparison.OrdinalIgnoreCase));
+                if (existing != null)
                 {
-                    await ShowErrorDialog("该邮箱账号已存在");
+                    if (existing.Provider != EmailProvider.Gmail)
+                    {
+                        await ShowErrorDialog("该邮箱账号已存在");
+                        return;
+                    }
+
+                    // 已存在的 Gmail 账号：这是一次重新授权。授权返回的邮箱与该账号一致（上面按邮箱匹配），
+                    // 新 Token 写入原 AccountId；账号 ID、代理设置、本地邮件与草稿保持不变。
+                    await KeeprawMail.Services.AppServices.Tokens.SaveAsync(existing.Id, login.Tokens);
+                    if (!existing.IsOAuth)
+                    {
+                        existing.AuthType = KeeprawMail.Core.Storage.AccountAuthTypes.OAuth2;
+                        await _dbContext.SaveAccountAsync(existing);
+                    }
+                    await ShowInfoDialog("已重新授权", "该 Gmail 账号已存在，已用本次授权更新它的登录凭据（账号、代理设置和本地邮件均保留）。");
+                    this.Close();
                     return;
                 }
 
@@ -284,6 +300,18 @@ namespace KeeprawMail.Views
                 "Sina" => EmailProvider.Sina,
                 _ => EmailProvider.Custom
             };
+        }
+
+        private async System.Threading.Tasks.Task ShowInfoDialog(string title, string message)
+        {
+            var dialog = new ContentDialog
+            {
+                Title = title,
+                Content = message,
+                CloseButtonText = "确定",
+                XamlRoot = this.Content.XamlRoot
+            };
+            await dialog.ShowAsync();
         }
 
         private async System.Threading.Tasks.Task ShowErrorDialog(string message)

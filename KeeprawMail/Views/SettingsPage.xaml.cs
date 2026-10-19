@@ -364,6 +364,47 @@ namespace KeeprawMail.Views
             }
         }
         /// <summary>
+        /// 重新授权按钮点击事件：Refresh Token 失效时，不删除账号即可重新完成 Google 授权。
+        /// 授权返回的邮箱必须与该账号一致，否则拒绝保存。
+        /// </summary>
+        private async void ReauthorizeAccount_Click(object sender, RoutedEventArgs e)
+        {
+            if (sender is not Button button || button.Tag is not string accountId)
+                return;
+
+            button.IsEnabled = false;
+            try
+            {
+                var dbContext = new Data.DatabaseContext();
+                var account = (await dbContext.GetAccountsAsync()).FirstOrDefault(a => a.Id == accountId);
+                if (account == null)
+                {
+                    await ShowErrorDialog("错误", "找不到该账号");
+                    return;
+                }
+
+                await Services.AppServices.ReauthorizeGmailAsync(account);
+                await ShowSuccessDialog("重新授权成功", $"{account.Email} 已重新授权，账号、代理设置和本地邮件均已保留。");
+            }
+            catch (KeeprawMail.Core.Auth.OAuthAccountMismatchException ex)
+            {
+                await ShowErrorDialog("账号不一致", ex.Message);
+            }
+            catch (KeeprawMail.Core.Auth.OAuthUserCancelledException ex)
+            {
+                await ShowErrorDialog("已取消", ex.Message);
+            }
+            catch (Exception ex)
+            {
+                await ShowErrorDialog("重新授权失败", ex.Message);
+            }
+            finally
+            {
+                button.IsEnabled = true;
+            }
+        }
+
+        /// <summary>
         /// 删除账号按钮点击事件
         /// </summary>
         private async void DeleteAccount_Click(object sender, RoutedEventArgs e)
