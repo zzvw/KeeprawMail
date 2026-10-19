@@ -1,0 +1,202 @@
+<Page
+    x:Class="KeeprawMail.Views.MailPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="using:KeeprawMail.Views"
+    xmlns:models="using:KeeprawMail.Models"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d">
+
+    <Grid Background="{ThemeResource ApplicationPageBackgroundThemeBrush}">
+        <Grid.RowDefinitions>
+            <!-- Row 0: Unified Toolbar -->
+            <RowDefinition Height="Auto"/>
+            <!-- Row 1: Mail View Area -->
+            <RowDefinition Height="*"/>
+            <!-- Row 2: Status Bar -->
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <!-- C. Unified Toolbar -->
+        <Grid Grid.Row="0" Padding="8,8,8,8" BorderBrush="{ThemeResource SystemControlForegroundBaseLowBrush}" BorderThickness="0,0,0,1">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/> <!-- Left Actions -->
+                <ColumnDefinition Width="*"/>    <!-- Spacer -->
+                <ColumnDefinition Width="Auto"/> <!-- Search -->
+            </Grid.ColumnDefinitions>
+
+            <CommandBar DefaultLabelPosition="Right" Background="Transparent" IsOpen="False" OverflowButtonVisibility="Auto">
+                <AppBarButton Label="New Mail" Click="NewMailButton_Click">
+                    <AppBarButton.Icon>
+                        <SymbolIcon Symbol="Mail"/>
+                    </AppBarButton.Icon>
+                </AppBarButton>
+                <AppBarSeparator/>
+                <AppBarButton Label="Sync" Command="{x:Bind ViewModel.RefreshCommand}">
+                    <AppBarButton.Icon>
+                        <SymbolIcon Symbol="Sync"/>
+                    </AppBarButton.Icon>
+                </AppBarButton>
+                <AppBarSeparator/>
+                <AppBarButton Label="Delete" Click="DeleteButton_Click">
+                    <AppBarButton.Icon>
+                        <SymbolIcon Symbol="Delete"/>
+                    </AppBarButton.Icon>
+                </AppBarButton>
+                <AppBarButton Label="Mark as Unread" Command="{x:Bind ViewModel.MarkAsUnreadCommand}">
+                    <AppBarButton.Icon>
+                        <FontIcon Glyph="&#xE9D5;"/>
+                    </AppBarButton.Icon>
+                </AppBarButton>
+                <AppBarButton Label="Forward" Click="ForwardButton_Click">
+                    <AppBarButton.Icon>
+                        <SymbolIcon Symbol="Forward"/>
+                    </AppBarButton.Icon>
+                </AppBarButton>
+                <AppBarButton Label="Reply" Click="ReplyButton_Click">
+                    <AppBarButton.Icon>
+                        <FontIcon Glyph="&#xE97A;"/>
+                    </AppBarButton.Icon>
+                </AppBarButton>
+            </CommandBar>
+
+            <!-- Search Box -->
+            <AutoSuggestBox Grid.Column="2" 
+                            Width="250" 
+                            PlaceholderText="Search emails (Ctrl+E)" 
+                            QueryIcon="Find"
+                            Text="{x:Bind ViewModel.SearchQuery, Mode=TwoWay}">
+                <AutoSuggestBox.KeyboardAccelerators>
+                    <KeyboardAccelerator Key="Enter" />
+                </AutoSuggestBox.KeyboardAccelerators>
+            </AutoSuggestBox>
+        </Grid>
+
+        <!-- Mail View Area (Split View) -->
+        <Grid Grid.Row="1">
+            <Grid.ColumnDefinitions>
+                <!-- D. Mail List -->
+                <ColumnDefinition Width="350" MinWidth="250" MaxWidth="600"/>
+                <!-- Splitter -->
+                <ColumnDefinition Width="Auto"/>
+                <!-- E. Reading Pane -->
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+
+            <!-- Mail List - ItemsSource set in Code-behind -->
+            <ListView Grid.Column="0" 
+                      x:Name="EmailListView"
+                      SelectionMode="Single"
+                      SelectionChanged="EmailListView_SelectionChanged">
+                <ListView.ItemTemplate>
+                    <DataTemplate x:DataType="models:EmailMessage">
+                        <Grid Padding="12,8" ColumnSpacing="12">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto"/>  <!-- Unread indicator -->
+                                <ColumnDefinition Width="*"/>     <!-- Content -->
+                                <ColumnDefinition Width="Auto"/>  <!-- Time -->
+                            </Grid.ColumnDefinitions>
+                            
+                            <!-- 未读指示器 -->
+                            <Ellipse Grid.Column="0" 
+                                     Width="8" 
+                                     Height="8" 
+                                     Fill="{ThemeResource SystemAccentColor}"
+                                     VerticalAlignment="Top"
+                                     Margin="0,6,0,0"
+                                     Visibility="{x:Bind UnreadIndicatorVisibility, Mode=OneWay}"/>
+                            
+                            <!-- 邮件内容 -->
+                            <StackPanel Grid.Column="1" Spacing="2">
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    
+                                    <!-- 发件人 -->
+                                    <TextBlock Text="{x:Bind SenderName}" 
+                                               FontWeight="{x:Bind SubjectFontWeight, Mode=OneWay}"
+                                               FontSize="14"
+                                               TextTrimming="CharacterEllipsis"
+                                               MaxLines="1"/>
+
+                                    <!-- 星标按钮 -->
+                                    <Button Grid.Column="1"
+                                            Background="Transparent"
+                                            BorderThickness="0"
+                                            Padding="4"
+                                            Click="StarButton_Click">
+                                        <FontIcon Glyph="{x:Bind StarGlyph, Mode=OneWay}" 
+                                                  Foreground="{x:Bind StarForeground, Mode=OneWay}" 
+                                                  FontSize="16"/>
+                                    </Button>
+                                </Grid>
+                                
+                                <!-- 主题 -->
+                                <TextBlock Text="{x:Bind Subject}" 
+                                           FontSize="13"
+                                           TextTrimming="CharacterEllipsis"
+                                           MaxLines="1"/>
+                                
+                                <!-- 摘要 -->
+                                <TextBlock Text="{x:Bind Snippet}" 
+                                           FontSize="12"
+                                           Foreground="{ThemeResource SystemControlForegroundBaseMediumBrush}"
+                                           TextTrimming="CharacterEllipsis"
+                                           MaxLines="2"
+                                           TextWrapping="Wrap"/>
+                            </StackPanel>
+                            
+                            <!-- 时间戳 -->
+                            <TextBlock Grid.Column="2" 
+                                       Text="{x:Bind DisplayDate}" 
+                                       FontSize="11"
+                                       Foreground="{ThemeResource SystemControlForegroundBaseMediumBrush}"
+                                       VerticalAlignment="Top"
+                                       Margin="0,4,0,0"
+                                       ToolTipService.ToolTip="{x:Bind FullDateTooltip}"/>
+                        </Grid>
+                    </DataTemplate>
+                </ListView.ItemTemplate>
+            </ListView>
+
+            <!-- Grid Splitter -->
+            <Border Grid.Column="1" Width="1" Background="{ThemeResource SystemControlForegroundBaseLowBrush}"/>
+
+            <!-- E. Reading Pane with TabView -->
+            <Grid Grid.Column="2" Background="{ThemeResource ApplicationPageBackgroundThemeBrush}">
+                <!-- Placeholder when no tabs open -->
+                <TextBlock x:Name="PlaceholderText"
+                           Text="Select an email to read" 
+                           HorizontalAlignment="Center" 
+                           VerticalAlignment="Center" 
+                           Foreground="{ThemeResource SystemControlForegroundBaseMediumBrush}"
+                           Visibility="Visible"/>
+                
+                <!-- TabView for multiple emails -->
+                <TabView x:Name="EmailTabView"
+                         Visibility="Collapsed"
+                         VerticalAlignment="Stretch"
+                         HorizontalAlignment="Stretch"
+                         TabWidthMode="SizeToContent"
+                         CanDragTabs="True"
+                         CanReorderTabs="True"
+                         TabCloseRequested="EmailTabView_TabCloseRequested">
+                </TabView>
+            </Grid>
+        </Grid>
+
+        <!-- Status Bar -->
+        <Border Grid.Row="2" 
+                Background="{ThemeResource SystemControlBackgroundChromeMediumLowBrush}" 
+                BorderBrush="{ThemeResource SystemControlForegroundBaseLowBrush}" 
+                BorderThickness="0,1,0,0" 
+                Padding="12,6">
+            <TextBlock Text="{x:Bind ViewModel.StatusMessage, Mode=OneWay}" 
+                       FontSize="12" 
+                       Foreground="{ThemeResource SystemControlForegroundBaseHighBrush}"/>
+        </Border>
+    </Grid>
+</Page>

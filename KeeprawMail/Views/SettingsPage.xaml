@@ -1,0 +1,100 @@
+<Page
+    x:Class="KeeprawMail.Views.SettingsPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="using:KeeprawMail.Views"
+    xmlns:models="using:KeeprawMail.Models"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d">
+
+    <Grid Padding="24" Background="{ThemeResource ApplicationPageBackgroundThemeBrush}">
+        <StackPanel Spacing="24">
+            <TextBlock Text="Settings" FontSize="28" FontWeight="SemiBold"/>
+            
+            <TextBlock Text="General" FontSize="18" FontWeight="SemiBold"/>
+            <StackPanel Spacing="12">
+                <ToggleSwitch x:Name="DarkModeToggle" 
+                              Header="Dark Mode" 
+                              Toggled="DarkModeToggle_Toggled"/>
+                <ToggleSwitch Header="Notifications" IsOn="True"/>
+            </StackPanel>
+
+            <TextBlock Text="Accounts" FontSize="18" FontWeight="SemiBold" Margin="0,12,0,0"/>
+            <TextBlock Text="Manage proxy settings for each account" 
+                       Foreground="{ThemeResource SystemControlForegroundBaseMediumBrush}"
+                       TextWrapping="Wrap"
+                       Margin="0,0,0,8"/>
+            <ListView x:Name="AccountsListView" 
+                      SelectionMode="None"
+                      MaxHeight="300"
+                      BorderBrush="{ThemeResource SystemControlForegroundBaseLowBrush}"
+                      BorderThickness="1"
+                      CornerRadius="4">
+                <ListView.ItemTemplate>
+                    <DataTemplate x:DataType="models:AccountProfile">
+                        <Grid Padding="12,8" ColumnSpacing="12">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            
+                            <StackPanel Grid.Column="0">
+                                <TextBlock Text="{x:Bind Email}" FontWeight="SemiBold"/>
+                                <TextBlock Foreground="{ThemeResource SystemControlForegroundBaseMediumBrush}"
+                                           FontSize="12">
+                                    <Run Text="Proxy: "/>
+                                    <Run Text="{x:Bind ProxyType}"/>
+                                    <Run Text=" "/>
+                                    <Run Text="{x:Bind ProxyHost}"/>
+                                    <Run Text=":"/>
+                                    <Run Text="{x:Bind ProxyPort}"/>
+                                </TextBlock>
+                            </StackPanel>
+                            
+                            <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8">
+                                <Button Content="Edit Proxy" 
+                                        Click="EditAccountProxy_Click"
+                                        Tag="{x:Bind Id}"/>
+                                <Button Content="Delete" 
+                                        Click="DeleteAccount_Click"
+                                        Tag="{x:Bind Id}"/>
+                            </StackPanel>
+                        </Grid>
+                    </DataTemplate>
+                </ListView.ItemTemplate>
+            </ListView>
+
+            <TextBlock Text="Global Proxy" FontSize="18" FontWeight="SemiBold" Margin="0,12,0,0"/>
+            <TextBlock Text="Default proxy settings for all accounts (can be overridden per account)" 
+                       Foreground="{ThemeResource SystemControlForegroundBaseMediumBrush}"
+                       TextWrapping="Wrap"
+                       Margin="0,0,0,8"/>
+            <StackPanel Spacing="12">
+                <ComboBox x:Name="ProxyTypeComboBox" 
+                          Header="Proxy Type" 
+                          SelectionChanged="ProxyType_Changed"
+                          HorizontalAlignment="Stretch">
+                    <ComboBoxItem Content="None (Direct Connection)" Tag="NONE" IsSelected="True"/>
+                    <ComboBoxItem Content="HTTP" Tag="HTTP"/>
+                    <ComboBoxItem Content="SOCKS5" Tag="SOCKS5"/>
+                </ComboBox>
+                <TextBox x:Name="ProxyHostTextBox" 
+                         Header="Proxy Host" 
+                         PlaceholderText="127.0.0.1"/>
+                <NumberBox x:Name="ProxyPortNumberBox" 
+                           Header="Proxy Port" 
+                           Value="7890"
+                           Minimum="1"
+                           Maximum="65535"
+                           SpinButtonPlacementMode="Inline"/>
+                <Button Content="Save Proxy Settings" 
+                        Click="SaveProxy_Click"
+                        Style="{StaticResource AccentButtonStyle}"/>
+            </StackPanel>
+            
+            <TextBlock Text="About" FontSize="18" FontWeight="SemiBold" Margin="0,12,0,0"/>
+            <TextBlock Text="Keepraw Mail v0.1.0" Foreground="{ThemeResource SystemControlForegroundBaseMediumBrush}"/>
+        </StackPanel>
+    </Grid>
+</Page>

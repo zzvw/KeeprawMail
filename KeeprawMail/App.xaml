@@ -1,0 +1,21 @@
+<Application
+    x:Class="KeeprawMail.App"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="using:KeeprawMail"
+    xmlns:converters="using:KeeprawMail.Converters">
+    <Application.Resources>
+        <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+                <XamlControlsResources xmlns="using:Microsoft.UI.Xaml.Controls" />
+                <!-- Other merged dictionaries here -->
+            </ResourceDictionary.MergedDictionaries>
+            
+            <!-- 值转换器 -->
+            <converters:DateTimeToStringConverter x:Key="DateTimeToStringConverter"/>
+            <converters:InverseBoolToVisibilityConverter x:Key="InverseBoolToVisibilityConverter"/>
+            <converters:BoolToFontWeightConverter x:Key="BoolToFontWeightConverter"/>
+            <converters:NullToVisibleConverter x:Key="NullToVisibleConverter"/>
+        </ResourceDictionary>
+    </Application.Resources>
+</Application>

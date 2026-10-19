@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>撰写邮件</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #f5f5f5;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .header {
+            background-color: #fff;
+            border-bottom: 1px solid #e0e0e0;
+            padding: 16px 20px;
+        }
+
+        .header h2 {
+            font-size: 18px;
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 12px;
+        }
+
+        .field-group {
+            margin-bottom: 12px;
+        }
+
+        .field-group label {
+            display: block;
+            font-size: 12px;
+            color: #666;
+            margin-bottom: 4px;
+        }
+
+        .field-group input {
+            width: 100%;
+            padding: 8px 12px;
+            border: 1px solid #d0d0d0;
+            border-radius: 4px;
+            font-size: 14px;
+            font-family: inherit;
+        }
+
+        .field-group input:focus {
+            outline: none;
+            border-color: #0078d4;
+        }
+
+        .editor-container {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            background-color: #fff;
+            margin: 0;
+            overflow: hidden;
+        }
+
+        #editor {
+            flex: 1;
+            border: 1px solid #e0e0e0;
+            padding: 12px;
+            font-size: 14px;
+            overflow-y: auto;
+        }
+
+        #editor:focus {
+            outline: none;
+            border-color: #0078d4;
+        }
+
+        .footer {
+            background-color: #fff;
+            border-top: 1px solid #e0e0e0;
+            padding: 12px 20px;
+            display: flex;
+            justify-content: flex-end;
+            gap: 12px;
+        }
+
+        .btn {
+            padding: 8px 24px;
+            border: none;
+            border-radius: 4px;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+
+        .btn-cancel {
+            background-color: #f0f0f0;
+            color: #333;
+        }
+
+        .btn-cancel:hover {
+            background-color: #e0e0e0;
+        }
+
+        .btn-send {
+            background-color: #0078d4;
+            color: #fff;
+        }
+
+        .btn-send:hover {
+            background-color: #005a9e;
+        }
+
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .loading-overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background-color: rgba(0, 0, 0, 0.5);
+            z-index: 9999;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .loading-overlay.active {
+            display: flex;
+        }
+
+        .spinner {
+            width: 48px;
+            height: 48px;
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #0078d4;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            0% {
+                transform: rotate(0deg);
+            }
+
+            100% {
+                transform: rotate(360deg);
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <div class="header">
+        <h2>撰写邮件</h2>
+        <div class="field-group">
+            <label for="to-input">收件人</label>
+            <input type="email" id="to-input" placeholder="example@email.com">
+        </div>
+        <div class="field-group">
+            <label for="subject-input">主题</label>
+            <input type="text" id="subject-input" placeholder="邮件主题">
+        </div>
+    </div>
+
+    <div class="editor-container">
+        <div id="editor" contenteditable="true"></div>
+    </div>
+
+    <div class="footer">
+        <button class="btn btn-cancel" id="cancel-btn">取消</button>
+        <button class="btn btn-send" id="send-btn">发送</button>
+    </div>
+
+    <div class="loading-overlay" id="loading-overlay">
+        <div class="spinner"></div>
+    </div>
+
+    <script>
+        console.log('[ComposeTab] Page loading...');
+
+        const toInput = document.getElementById('to-input');
+        const subjectInput = document.getElementById('subject-input');
+        const editor = document.getElementById('editor');
+        const sendBtn = document.getElementById('send-btn');
+        const cancelBtn = document.getElementById('cancel-btn');
+        const loadingOverlay = document.getElementById('loading-overlay');
+        let draftId = '';
+        let autosaveTimer = null;
+        let isInitializing = false;
+
+        function initializeEditor(data) {
+            console.log('[ComposeTab] Initializing editor with data:', data);
+            isInitializing = true;
+            if (data.draftId) draftId = data.draftId;
+            if (data.to) toInput.value = data.to;
+            if (data.subject) subjectInput.value = data.subject;
+            if (data.body) editor.innerHTML = data.body;
+            isInitializing = false;
+        }
+
+        function getContent() {
+            return {
+                to: toInput.value.trim(),
+                subject: subjectInput.value.trim(),
+                body: editor.innerHTML
+            };
+        }
+
+        function sendMessageToCSharp(type, data) {
+            if (window.chrome && window.chrome.webview) {
+                console.log('[ComposeTab] Sending message to C#:', { type, data });
+                window.chrome.webview.postMessage({ type, data });
+            } else {
+                console.error('[ComposeTab] WebView2 API not available');
+            }
+        }
+
+        function autosaveDraft() {
+            const content = getContent();
+            if (!draftId) return;
+            if (!content.to && !content.subject && !content.body.trim()) return;
+            sendMessageToCSharp('autosave', { draftId, ...content });
+        }
+
+        function scheduleAutosave() {
+            if (isInitializing) return;
+            if (autosaveTimer) clearTimeout(autosaveTimer);
+            autosaveTimer = setTimeout(autosaveDraft, 1500);
+        }
+
+        toInput.addEventListener('input', scheduleAutosave);
+        subjectInput.addEventListener('input', scheduleAutosave);
+        editor.addEventListener('input', scheduleAutosave);
+        setInterval(autosaveDraft, 15000);
+
+        sendBtn.addEventListener('click', () => {
+            const content = getContent();
+            if (!content.to) {
+                alert('请输入收件人');
+                return;
+            }
+            if (!content.subject) {
+                alert('请输入主题');
+                return;
+            }
+            loadingOverlay.classList.add('active');
+            sendBtn.disabled = true;
+            autosaveDraft();
+            sendMessageToCSharp('send', content);
+        });
+
+        cancelBtn.addEventListener('click', () => {
+            sendMessageToCSharp('cancel', {});
+        });
+
+        if (window.chrome && window.chrome.webview) {
+            window.chrome.webview.addEventListener('message', (event) => {
+                console.log('[ComposeTab] Received message from C#:', event.data);
+                const message = event.data;
+                if (message.type === 'init') {
+                    initializeEditor(message.data);
+                } else if (message.type === 'sendResult') {
+                    loadingOverlay.classList.remove('active');
+                    sendBtn.disabled = false;
+                    if (message.data.success) {
+                        console.log('[ComposeTab] Send successful');
+                    } else {
+                        alert('发送失败: ' + message.data.error);
+                    }
+                }
+            });
+        }
+
+        window.addEventListener('load', () => {
+            console.log('[ComposeTab] Page loaded, ready for initialization');
+            sendMessageToCSharp('ready', {});
+        });
+    </script>
+</body>
+
+</html>
