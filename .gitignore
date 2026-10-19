@@ -1,40 +1,124 @@
-# Visual Studio
+# ==========================================================================
+# Visual Studio / IDE
+# ==========================================================================
 .vs/
+.vscode/
+.idea/
 *.user
 *.suo
 *.userosscache
+*.rsuser
 *.sln.docstates
+*.DotSettings.user
+*.dbmdl
+*.jfm
+*.swp
+*.swo
+*~
 
-# .NET build outputs
+# ==========================================================================
+# .NET / MSBuild build output
+# ==========================================================================
 [Bb]in/
 [Oo]bj/
-
-# Build artifacts
+[Oo]utput/
 [Dd]ebug/
+[Dd]ebugPublic/
 [Rr]elease/
+[Rr]eleases/
 x64/
 x86/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+bld/
+*.dll
+*.exe
+*.pdb
+project.lock.json
 
+# ==========================================================================
 # NuGet
+# ==========================================================================
 *.nupkg
+*.snupkg
 packages/
+.nuget/
+nuget.exe
 
-# Test results
+# ==========================================================================
+# Test / coverage
+# ==========================================================================
 TestResults/
 *.trx
+*.coverage
+*.coverlet.json
+coverage*.xml
+coverage*.json
 
-# Local logs
-*.log
-logs/
+# ==========================================================================
+# WebView2
+# ==========================================================================
+*.WebView2/
+WebView2/
+Microsoft.WebView2.FixedVersionRuntime*
 
-# Runtime database files
+# ==========================================================================
+# Local runtime data / databases
+# ==========================================================================
+*.db
 *.db-wal
 *.db-shm
+*.sqlite
+*.sqlite3
+*.log
+logs/
+Log/
 
-# Temporary files
+# ==========================================================================
+# Packaging / MSIX
+# ==========================================================================
+AppPackages/
+BundleArtifacts/
+*.appx
+*.appxbundle
+*.msix
+*.msixbundle
+*.appinstaller
+SignAppPackage/
+
+# ==========================================================================
+# Temporary / editor backup files
+# ==========================================================================
 *.tmp
 *.temp
 *.bak
+*.backup
+*.orig
+*.rej
 
-# WebView2 Fixed Version Runtime
-Microsoft.WebView2.FixedVersionRuntime*
+# ==========================================================================
+# OS files
+# ==========================================================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ==========================================================================
+# Secrets / local environment
+# ==========================================================================
+.env
+.env.local
+.env.*.local
+*.pfx
+*.p12
+*.key
+
+# ==========================================================================
+# One-off scratch scripts (root level debugging helpers)
+# ==========================================================================
+/*.csx
