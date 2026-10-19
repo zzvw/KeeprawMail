@@ -109,7 +109,7 @@ jobs:
           "AOT/trim warnings: $($warnings.Count)" | Tee-Object -FilePath logs/aot-output.txt -Append
           Write-Host "::notice title=Native AOT publish::KeeprawMail.exe $size bytes; IL/AOT warnings: $($warnings.Count)"
           # 裁剪/AOT 警告意味着运行时可能失败（例如反射 JSON），不允许带警告通过
-          if ($warnings.Count -gt 0) { $warnings | ForEach-Object { Write-Host $_ }; Write-Error "Native AOT publish has IL warnings"; exit 1 }
+          if ($warnings.Count -gt 0) { $warnings | ForEach-Object { $t = $_ -replace '\[.*?\]$',''; if ($t.Length -gt 900) { $t = $t.Substring(0,900) }; Write-Host "::warning title=IL warning::$t" }; Write-Error "Native AOT publish has IL warnings"; exit 1 }
 
       - uses: actions/upload-artifact@v4
         if: always()
