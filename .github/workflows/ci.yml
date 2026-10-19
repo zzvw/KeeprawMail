@@ -30,6 +30,13 @@ jobs:
           dotnet test KeeprawMail.Core.Tests/KeeprawMail.Core.Tests.csproj -c Release
           --logger "trx;LogFileName=core-linux.trx" --logger "console;verbosity=normal"
           --results-directory TestResults
+      - name: Summarize
+        if: always()
+        shell: pwsh
+        run: |
+          [xml]$trx = Get-Content TestResults/core-linux.trx
+          $c = $trx.TestRun.ResultSummary.Counters
+          Write-Host "::notice title=Linux test results::total=$($c.total) passed=$($c.passed) failed=$($c.failed) notExecuted=$($c.notExecuted) (DPAPI test is skipped on Linux by design)"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -75,7 +82,9 @@ jobs:
           Write-Host "DPAPI test outcome: $outcome"
           if ($outcome -ne "Passed") { Write-Error "DPAPI test outcome is '$outcome', expected Passed"; exit 1 }
           $counters = (Select-Xml -Xml $trx -Namespace $ns -XPath "//t:Counters").Node
-          "total=$($counters.total) passed=$($counters.passed) failed=$($counters.failed) notExecuted=$($counters.notExecuted)" | Tee-Object -FilePath logs/test-summary.txt
+          $summary = "Windows tests: total=$($counters.total) passed=$($counters.passed) failed=$($counters.failed) notExecuted=$($counters.notExecuted); DPAPI=$outcome"
+          $summary | Tee-Object -FilePath logs/test-summary.txt
+          Write-Host "::notice title=Windows test results::$summary"
 
       - name: Publish WinUI app (Release, win-x64, Native AOT)
         shell: pwsh
@@ -95,8 +104,12 @@ jobs:
           $size = (Get-Item $exe).Length
           "KeeprawMail.exe size: $size bytes" | Tee-Object -FilePath logs/aot-output.txt
           Get-ChildItem artifacts/KeeprawMail-win-x64 | Select-Object Name, Length | Format-Table | Out-String | Tee-Object -FilePath logs/aot-output.txt -Append
-          Select-String -Path logs/publish.log -Pattern "warning IL|warning AOT" | ForEach-Object { $_.Line } | Tee-Object -FilePath logs/aot-warnings.txt
-          "AOT/trim warnings: $((Get-Content logs/aot-warnings.txt -ErrorAction SilentlyContinue | Measure-Object -Line).Lines)" | Tee-Object -FilePath logs/aot-output.txt -Append
+          $warnings = @(Select-String -Path logs/publish.log -Pattern "warning IL\d{4}" | ForEach-Object { $_.Line } | Sort-Object -Unique)
+          $warnings | Set-Content logs/aot-warnings.txt
+          "AOT/trim warnings: $($warnings.Count)" | Tee-Object -FilePath logs/aot-output.txt -Append
+          Write-Host "::notice title=Native AOT publish::KeeprawMail.exe $size bytes; IL/AOT warnings: $($warnings.Count)"
+          # 裁剪/AOT 警告意味着运行时可能失败（例如反射 JSON），不允许带警告通过
+          if ($warnings.Count -gt 0) { $warnings | ForEach-Object { Write-Host $_ }; Write-Error "Native AOT publish has IL warnings"; exit 1 }
 
       - uses: actions/upload-artifact@v4
         if: always()

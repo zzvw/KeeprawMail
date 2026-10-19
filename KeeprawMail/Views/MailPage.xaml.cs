@@ -516,19 +516,20 @@ namespace KeeprawMail.Views
                             // 等待一小段时间确保 JavaScript 完全加载
                             await System.Threading.Tasks.Task.Delay(500);
 
-                            var initData = new
+                            // Native AOT 下禁用了基于反射的 JSON 序列化（匿名类型会在运行时抛异常），改用 JsonObject
+                            var initData = new System.Text.Json.Nodes.JsonObject
                             {
-                                type = "init",
-                                data = new
+                                ["type"] = "init",
+                                ["data"] = new System.Text.Json.Nodes.JsonObject
                                 {
-                                    draftId = draftId,
-                                    to = to ?? "",
-                                    subject = subject ?? "",
-                                    body = body ?? ""
+                                    ["draftId"] = draftId,
+                                    ["to"] = to ?? "",
+                                    ["subject"] = subject ?? "",
+                                    ["body"] = body ?? ""
                                 }
                             };
 
-                            var json = System.Text.Json.JsonSerializer.Serialize(initData);
+                            var json = initData.ToJsonString();
                             webView.CoreWebView2.PostWebMessageAsJson(json);
                             System.Diagnostics.Debug.WriteLine($"[MailPage] 初始化数据已发送: {json}");
                         }
@@ -771,17 +772,18 @@ namespace KeeprawMail.Views
         /// </summary>
         private async System.Threading.Tasks.Task SendResultToWebView(WebView2 webView, bool success, string error)
         {
-            var resultData = new
+            // Native AOT 安全：不使用反射序列化匿名类型
+            var resultData = new System.Text.Json.Nodes.JsonObject
             {
-                type = "sendResult",
-                data = new
+                ["type"] = "sendResult",
+                ["data"] = new System.Text.Json.Nodes.JsonObject
                 {
-                    success,
-                    error
+                    ["success"] = success,
+                    ["error"] = error
                 }
             };
 
-            var json = System.Text.Json.JsonSerializer.Serialize(resultData);
+            var json = resultData.ToJsonString();
             webView.CoreWebView2.PostWebMessageAsJson(json);
         }
     }
