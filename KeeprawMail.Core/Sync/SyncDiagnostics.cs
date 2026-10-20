@@ -108,6 +108,9 @@ public static class MailConnectionDiagnostics
                     SocketError.ConnectionRefused => $"无法连接到{proxyText}：端口未监听（代理软件未启动或端口填写错误）。",
                     SocketError.HostNotFound or SocketError.NoData => $"无法解析{proxyText}的主机名。",
                     SocketError.TimedOut => $"连接{proxyText}超时。",
+                    // 已连上代理端口，但握手过程中被对方重置：最常见的原因是代理类型配错
+                    SocketError.ConnectionReset or SocketError.ConnectionAborted or SocketError.Shutdown =>
+                        $"{proxyText}在握手时断开了连接：代理类型可能不匹配（HTTP 与 SOCKS5 填反），或代理拒绝转发到 {target}。",
                     _ => $"无法连接到{proxyText}：{se.SocketErrorCode}。",
                 }, ex);
 
