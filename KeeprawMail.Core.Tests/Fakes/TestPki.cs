@@ -15,7 +15,11 @@ public sealed class TestPki : IDisposable
     private readonly RSA _caKey = RSA.Create(2048);
     private readonly HttpListener _crlServer = new();
     private readonly List<(byte[] Serial, DateTimeOffset When)> _revoked = new();
-    private byte[] _crl = Array.Empty<byte>();
+    private volatile byte[] _crl = Array.Empty<byte>();
+    private int _crlRequests;
+
+    /// <summary>CRL HTTP 服务实际收到的请求数（用于证明吊销检查确实取到了 CRL）。</summary>
+    public int CrlRequests => Volatile.Read(ref _crlRequests);
     private BigInteger _crlNumber = 1;
 
     public X509Certificate2 Root { get; }
@@ -76,6 +80,13 @@ public sealed class TestPki : IDisposable
         }
     }
 
+    /// <summary>当前对外发布的 CRL 是否列出了该证书（按序列号精确匹配）。</summary>
+    public bool PublishedCrlContains(X509Certificate2 cert)
+    {
+        var builder = CertificateRevocationListBuilder.Load(_crl, out _);
+        return builder.RemoveEntry(cert.SerialNumberBytes.Span);
+    }
+
     private void RebuildCrl()
     {
         var b = new CertificateRevocationListBuilder();
@@ -91,6 +102,7 @@ public sealed class TestPki : IDisposable
             HttpListenerContext ctx;
             try { ctx = await _crlServer.GetContextAsync(); } catch { return; }
             var bytes = _crl;
+            Interlocked.Increment(ref _crlRequests);
             ctx.Response.ContentType = "application/pkix-crl";
             ctx.Response.ContentLength64 = bytes.Length;
             await ctx.Response.OutputStream.WriteAsync(bytes);

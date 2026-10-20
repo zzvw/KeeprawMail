@@ -1,10 +1,15 @@
 name: CI
 
+# push 只在 main 上触发；功能分支由 pull_request 检查覆盖，避免同一提交重复运行两套 CI。
 on:
   push:
-    branches: [ main, "pr1/**" ]
+    branches: [ main ]
   pull_request:
   workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -30,6 +35,17 @@ jobs:
           dotnet test KeeprawMail.Core.Tests/KeeprawMail.Core.Tests.csproj -c Release
           --logger "trx;LogFileName=core-linux.trx" --logger "console;verbosity=normal"
           --results-directory TestResults
+      - name: Repeat Tls_RevokedCertificate_Rejected 20x (Linux)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 20); do
+            dotnet test KeeprawMail.Core.Tests/KeeprawMail.Core.Tests.csproj -c Release --no-build \
+              --filter "FullyQualifiedName~TlsMailEndToEndTests.Tls_RevokedCertificate_Rejected" > repeat.log 2>&1 \
+              || { cat repeat.log; echo "::error title=Revocation repeat::iteration $i failed"; exit 1; }
+            grep -q "Passed:     1" repeat.log || { cat repeat.log; echo "::error::iteration $i did not run the test"; exit 1; }
+          done
+          echo "::notice title=Linux revocation repeat::Tls_RevokedCertificate_Rejected passed 20/20"
       - name: Summarize
         if: always()
         shell: pwsh
@@ -85,6 +101,16 @@ jobs:
           $summary = "Windows tests: total=$($counters.total) passed=$($counters.passed) failed=$($counters.failed) notExecuted=$($counters.notExecuted); DPAPI=$outcome"
           $summary | Tee-Object -FilePath logs/test-summary.txt
           Write-Host "::notice title=Windows test results::$summary"
+
+      - name: Repeat Tls_RevokedCertificate_Rejected 20x (Windows)
+        shell: pwsh
+        run: |
+          for ($i = 1; $i -le 20; $i++) {
+            $out = dotnet test KeeprawMail.Core.Tests/KeeprawMail.Core.Tests.csproj -c Release --no-build `
+              --filter "FullyQualifiedName~TlsMailEndToEndTests.Tls_RevokedCertificate_Rejected" 2>&1 | Out-String
+            if ($LASTEXITCODE -ne 0 -or $out -notmatch "Passed:\s+1") { Write-Host $out; Write-Host "::error title=Revocation repeat::iteration $i failed"; exit 1 }
+          }
+          Write-Host "::notice title=Windows revocation repeat::Tls_RevokedCertificate_Rejected passed 20/20"
 
       - name: Publish WinUI app (Release, win-x64, Native AOT)
         shell: pwsh

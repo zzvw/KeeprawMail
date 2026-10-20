@@ -125,13 +125,23 @@ public class ProxyRoutingTests
         await Assert.ThrowsAnyAsync<Exception>(() => client.ConnectAsync("smtp.test", 587, SecureSocketOptions.None));
         Assert.True(socksOnly.RejectedNonSocks > 0);
     }
+}
 
+/// <summary>
+/// 修改进程级代理环境的测试。放在不并行集合中：否则会与 TLS 吊销测试竞争 HttpClient.DefaultProxy。
+/// </summary>
+[Collection(ProcessEnvironmentCollection.Name)]
+public class EnvironmentProxyTests
+{
     [Fact]
     public async Task Direct_ConnectsWithoutProxy_AndIgnoresEnvironmentProxy()
     {
         await using var trap = new TestHttpProxy();
         var old = Environment.GetEnvironmentVariable("HTTP_PROXY");
+        var oldDefault = HttpClient.DefaultProxy;
+        // 模拟系统/环境代理：环境变量 + 进程默认代理都指向陷阱代理
         Environment.SetEnvironmentVariable("HTTP_PROXY", $"http://127.0.0.1:{trap.Port}");
+        HttpClient.DefaultProxy = new System.Net.WebProxy($"http://127.0.0.1:{trap.Port}");
         try
         {
             using var oauth = new FakeOAuthServer();
@@ -162,6 +172,7 @@ public class ProxyRoutingTests
         finally
         {
             Environment.SetEnvironmentVariable("HTTP_PROXY", old);
+            HttpClient.DefaultProxy = oldDefault;
         }
     }
 }

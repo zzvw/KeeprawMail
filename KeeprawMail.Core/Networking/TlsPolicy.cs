@@ -20,6 +20,12 @@ public sealed class TlsValidationOptions
 
     /// <summary>获取 CRL/OCSP 的超时。</summary>
     public TimeSpan RevocationUrlTimeout { get; init; } = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    /// 诊断回调（仅在 <see cref="CustomRoots"/> 模式下调用）：报告自定义链的构建结果与全部状态标志，
+    /// 让测试能区分"CRL 明确吊销"与"吊销状态未知/离线"。
+    /// </summary>
+    public Action<bool, IReadOnlyList<X509ChainStatusFlags>>? ChainObserver { get; init; }
 }
 
 /// <summary>
@@ -63,12 +69,18 @@ public static class TlsPolicy
             chain.ChainPolicy.RevocationMode = options.RevocationMode;
             chain.ChainPolicy.RevocationFlag = X509RevocationFlag.ExcludeRoot;
             chain.ChainPolicy.UrlRetrievalTimeout = options.RevocationUrlTimeout;
-            chain.Build(leaf);
+            var built = chain.Build(leaf);
 
-            var statuses = chain.ChainStatus.Select(s => s.Status).ToArray();
+            var statuses = chain.ChainStatus.Select(s => s.Status).Where(s => s != X509ChainStatusFlags.NoError).ToArray();
+            options.ChainObserver?.Invoke(built, statuses);
+
+            // Build() 失败却没有给出任何状态：无法判断原因，按失败处理（fail closed）
+            if (!built && statuses.Length == 0)
+                return false;
+
             // 用自定义链的结果替换 SslStream 基于系统信任库得出的链错误
             var nonChainErrors = errors & ~SslPolicyErrors.RemoteCertificateChainErrors;
-            var chainErrors = statuses.Any(s => s != X509ChainStatusFlags.NoError)
+            var chainErrors = !built || statuses.Length > 0
                 ? SslPolicyErrors.RemoteCertificateChainErrors
                 : SslPolicyErrors.None;
             return Evaluate(nonChainErrors | chainErrors, statuses);

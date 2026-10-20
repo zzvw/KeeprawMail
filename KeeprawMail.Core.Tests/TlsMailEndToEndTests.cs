@@ -7,6 +7,7 @@ using MailKit.Net.Imap;
 using MailKit.Net.Smtp;
 using MailKit.Security;
 using MimeKit;
+using System.Security.Cryptography.X509Certificates;
 
 namespace KeeprawMail.Core.Tests;
 
@@ -155,32 +156,63 @@ public class TlsMailEndToEndTests : IDisposable
     }
 
     // ---------- TLS 证书校验 ----------
+    // 每个场景都记录自定义链的 Build() 结果与 ChainStatus，并检查 CRL 服务是否真的被访问，
+    // 从而区分"CRL 明确吊销"（Revoked）与"吊销状态未知 / 服务离线"（RevocationStatusUnknown / OfflineRevocation）。
 
-    private async Task ConnectImapAsync(string host, Fakes.TestPki trustPki, System.Security.Cryptography.X509Certificates.X509Certificate2 serverCert)
+    private sealed record ChainObservation(bool Built, X509ChainStatusFlags[] Statuses);
+
+    private async Task<ChainObservation?> ConnectImapAsync(string host, TestPki trustPki, X509Certificate2 serverCert)
     {
+        ChainObservation? observed = null;
         await using var server = new TlsMailServer(MailProtocol.Imap, TlsMode.Implicit, serverCert, "x");
         await using var proxy = new TestSocks5Proxy();
         proxy.Map(host, 993, server.Port);
-        using var client = new ImapClient { Timeout = 20000 };
+        using var client = new ImapClient { Timeout = 30000 };
         NetworkClientFactory.ConfigureMailClient(client, new ProxyEndpoint(ProxyKind.Socks5, "127.0.0.1", proxy.Port),
-            new TlsValidationOptions { CustomRoots = trustPki.Roots, RevocationUrlTimeout = TimeSpan.FromSeconds(5) });
-        await client.ConnectAsync(host, 993, SecureSocketOptions.SslOnConnect);
-        Assert.True(client.IsSecure);
-        await client.DisconnectAsync(false);
+            new TlsValidationOptions
+            {
+                CustomRoots = trustPki.Roots,
+                RevocationUrlTimeout = TimeSpan.FromSeconds(15),
+                ChainObserver = (built, statuses) => observed = new ChainObservation(built, statuses.ToArray()),
+            });
+        try
+        {
+            await client.ConnectAsync(host, 993, SecureSocketOptions.SslOnConnect);
+            Assert.True(client.IsSecure);
+            await client.DisconnectAsync(false);
+        }
+        catch (SslHandshakeException ex)
+        {
+            throw new SslHandshakeObserved(ex, observed);
+        }
+        return observed;
+    }
+
+    /// <summary>握手失败时把链观测结果一并带出，便于断言失败原因。</summary>
+    private sealed class SslHandshakeObserved(SslHandshakeException inner, ChainObservation? observation)
+        : Exception(inner.Message, inner)
+    {
+        public ChainObservation? Observation { get; } = observation;
     }
 
     [Fact]
-    public async Task Tls_ValidCertificate_Accepted()
+    public async Task Tls_ValidCertificate_Accepted_AfterRealCrlCheck()
     {
         using var cert = _pki.IssueServer(["imap.test"]);
-        await ConnectImapAsync("imap.test", _pki, cert);
+        var obs = await ConnectImapAsync("imap.test", _pki, cert);
+
+        Assert.NotNull(obs);
+        Assert.True(obs!.Built);
+        Assert.Empty(obs.Statuses);
+        Assert.True(_pki.CrlRequests >= 1, "吊销检查必须真的下载了 CRL");
     }
 
     [Fact]
     public async Task Tls_NameMismatch_Rejected()
     {
         using var cert = _pki.IssueServer(["other.test"]);
-        await Assert.ThrowsAsync<SslHandshakeException>(() => ConnectImapAsync("imap.test", _pki, cert));
+        var ex = await Assert.ThrowsAsync<SslHandshakeObserved>(() => ConnectImapAsync("imap.test", _pki, cert));
+        Assert.Empty(ex.Observation!.Statuses); // 链本身没问题，被拒绝的原因是主机名
     }
 
     [Fact]
@@ -188,7 +220,9 @@ public class TlsMailEndToEndTests : IDisposable
     {
         using var otherPki = new TestPki();
         using var cert = otherPki.IssueServer(["imap.test"]);
-        await Assert.ThrowsAsync<SslHandshakeException>(() => ConnectImapAsync("imap.test", _pki, cert));
+        var ex = await Assert.ThrowsAsync<SslHandshakeObserved>(() => ConnectImapAsync("imap.test", _pki, cert));
+        Assert.False(ex.Observation!.Built);
+        Assert.Contains(ex.Observation.Statuses, s => (s & (X509ChainStatusFlags.UntrustedRoot | X509ChainStatusFlags.PartialChain)) != 0);
     }
 
     [Fact]
@@ -196,13 +230,50 @@ public class TlsMailEndToEndTests : IDisposable
     {
         using var cert = _pki.IssueServer(["imap.test"]);
         _pki.Revoke(cert);
-        await Assert.ThrowsAsync<SslHandshakeException>(() => ConnectImapAsync("imap.test", _pki, cert));
+
+        // 前置条件：发布的 CRL 确实按序列号列出了这张证书
+        Assert.True(_pki.PublishedCrlContains(cert), "CRL 中必须包含被吊销证书的序列号");
+        var requestsBefore = _pki.CrlRequests;
+
+        var ex = await Assert.ThrowsAsync<SslHandshakeObserved>(() => ConnectImapAsync("imap.test", _pki, cert));
+
+        Assert.True(_pki.CrlRequests > requestsBefore, "CRL 服务必须收到请求");
+        Assert.False(ex.Observation!.Built);
+        Assert.Contains(X509ChainStatusFlags.Revoked, ex.Observation.Statuses);
+        // 明确吊销，而不是"状态未知/离线"被误判
+        Assert.DoesNotContain(X509ChainStatusFlags.OfflineRevocation, ex.Observation.Statuses);
     }
 
     [Fact]
     public async Task Tls_RevocationServerOffline_SoftFailAccepted()
     {
         using var cert = _pki.IssueServer(["imap.test"], crlUrl: TestPki.OfflineCrlUrl());
-        await ConnectImapAsync("imap.test", _pki, cert);
+        var obs = await ConnectImapAsync("imap.test", _pki, cert);
+
+        Assert.NotNull(obs);
+        Assert.NotEmpty(obs!.Statuses);
+        Assert.All(obs.Statuses, s => Assert.True(
+            (s & ~(X509ChainStatusFlags.RevocationStatusUnknown | X509ChainStatusFlags.OfflineRevocation)) == 0,
+            $"离线场景只能出现 RevocationStatusUnknown/OfflineRevocation，实际 {s}"));
+        Assert.DoesNotContain(X509ChainStatusFlags.Revoked, obs.Statuses);
+        Assert.Equal(0, _pki.CrlRequests); // 本 PKI 的 CRL 服务没有被访问
+    }
+
+    // ---------- TlsPolicy 回调本身的边界（不经网络） ----------
+
+    [Fact]
+    public void CustomRootCallback_RevokedLeaf_RejectedEvenWithoutSslErrors()
+    {
+        using var cert = _pki.IssueServer(["imap.test"]);
+        _pki.Revoke(cert);
+        var cb = TlsPolicy.CreateCallback(new TlsValidationOptions { CustomRoots = _pki.Roots, RevocationUrlTimeout = TimeSpan.FromSeconds(15) });
+        Assert.False(cb(this, cert, null, System.Net.Security.SslPolicyErrors.None));
+    }
+
+    [Fact]
+    public void CustomRootCallback_NullCertificate_Rejected()
+    {
+        var cb = TlsPolicy.CreateCallback(new TlsValidationOptions { CustomRoots = _pki.Roots });
+        Assert.False(cb(this, null, null, System.Net.Security.SslPolicyErrors.None));
     }
 }
