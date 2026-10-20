@@ -222,7 +222,10 @@ public class TlsMailEndToEndTests : IDisposable
         using var cert = otherPki.IssueServer(["imap.test"]);
         var ex = await Assert.ThrowsAsync<SslHandshakeObserved>(() => ConnectImapAsync("imap.test", _pki, cert));
         Assert.False(ex.Observation!.Built);
-        Assert.Contains(ex.Observation.Statuses, s => (s & (X509ChainStatusFlags.UntrustedRoot | X509ChainStatusFlags.PartialChain)) != 0);
+        // 两个测试 PKI 的根证书同名：Linux 报 UntrustedRoot/PartialChain，Windows CryptoAPI 会按名称匹配到受信任根、
+        // 再因密钥不符报 NotSignatureValid。三者都表示链无法连到受信任根，都必须拒绝。
+        Assert.Contains(ex.Observation.Statuses, s => (s & (X509ChainStatusFlags.UntrustedRoot
+            | X509ChainStatusFlags.PartialChain | X509ChainStatusFlags.NotSignatureValid)) != 0);
     }
 
     [Fact]
