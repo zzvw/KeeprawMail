@@ -9,6 +9,7 @@ public sealed class InMemoryCredentialStore : ICredentialStore
     public int Writes;
     public bool FailWrites;
     public bool CorruptReads;
+    public bool FailDeletes;
 
     public Task<string?> GetAsync(string key, CancellationToken ct = default)
         => Task.FromResult(Data.TryGetValue(key, out var v) ? (CorruptReads ? v + "x" : v) : null);
@@ -23,6 +24,7 @@ public sealed class InMemoryCredentialStore : ICredentialStore
 
     public Task DeleteAsync(string key, CancellationToken ct = default)
     {
+        if (FailDeletes) throw new IOException("credential store locked");
         Data.TryRemove(key, out _);
         return Task.CompletedTask;
     }

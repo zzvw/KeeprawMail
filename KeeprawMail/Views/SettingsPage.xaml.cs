@@ -384,7 +384,26 @@ namespace KeeprawMail.Views
                 }
 
                 await Services.AppServices.ReauthorizeGmailAsync(account);
-                await ShowSuccessDialog("重新授权成功", $"{account.Email} 已重新授权，账号、代理设置和本地邮件均已保留。");
+
+                // 重新授权只证明新 Token 已获取并保存，不代表已经能收信：提示并让用户立即做一次受控同步
+                var next = new ContentDialog
+                {
+                    Title = "授权已更新",
+                    Content = $"{account.Email} 的新授权已保存（账号、代理设置和本地邮件均保留）。\n\n" +
+                              "这一步还没有连接邮箱服务器。是否立即同步该账号，验证能否正常收信？",
+                    PrimaryButtonText = "立即同步",
+                    CloseButtonText = "稍后",
+                    DefaultButton = ContentDialogButton.Primary,
+                    XamlRoot = this.Content.XamlRoot
+                };
+                if (await next.ShowAsync() == ContentDialogResult.Primary)
+                {
+                    var report = await App.MainViewModel.SyncSingleAccountAsync(account.Id);
+                    if (report.Status == KeeprawMail.Core.Sync.AccountSyncStatus.Failed)
+                        await ShowErrorDialog("同步失败", report.Describe());
+                    else
+                        await ShowSuccessDialog(report.Status == KeeprawMail.Core.Sync.AccountSyncStatus.Success ? "同步成功" : "部分成功", report.Describe());
+                }
             }
             catch (KeeprawMail.Core.Auth.OAuthAccountMismatchException ex)
             {
@@ -428,19 +447,27 @@ namespace KeeprawMail.Views
                     if (result == ContentDialogResult.Primary)
                     {
                         var dbContext = new Data.DatabaseContext();
-                        await dbContext.DeleteAccountAsync(accountId);
-                        
-                        // 重新加载账号列表
+                        // 事务内删除本地邮件与账号；失败会抛出并回滚，账号与凭据保持可用
+                        var deletion = await dbContext.DeleteAccountAsync(accountId);
+
+                        // 刷新设置页账号列表与主界面账号 / 邮件列表
                         await LoadAccountsAsync();
-                        
-                        await ShowSuccessDialog("成功", "账号已删除");
+                        await App.MainViewModel.LoadLocalEmailsAsync();
+
+                        if (deletion.FullyCleaned)
+                            await ShowSuccessDialog("成功", $"账号已删除，同时删除了 {deletion.EmailsDeleted} 封本地邮件（服务器上的邮件不受影响）。");
+                        else
+                            await ShowErrorDialog("账号已删除，但清理未全部完成",
+                                $"账号和 {deletion.EmailsDeleted} 封本地邮件已从数据库删除；" +
+                                (deletion.CredentialsDeleted ? "" : "保存的凭据暂未删除；") +
+                                $"{deletion.PendingCleanup.Count} 项本地清理未完成，下次启动会自动重试。");
                     }
                 }
             }
             catch (Exception ex)
             {
-                System.Diagnostics.Debug.WriteLine($"删除账号失败: {ex.Message}");
-                await ShowErrorDialog("失败", ex.Message);
+                KeeprawMail.Core.Sync.DiagnosticLog.Write("account", $"delete failed: {ex.GetType().Name}: {ex.Message}");
+                await ShowErrorDialog("删除失败", $"数据库操作已回滚，账号、本地邮件和凭据均保持可用。\n{ex.Message}");
             }
         }
     }

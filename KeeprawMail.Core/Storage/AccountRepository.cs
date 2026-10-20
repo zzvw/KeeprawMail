@@ -76,6 +76,7 @@ public sealed class AccountRepository
             await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
         }
         await AccountCredentialMigrator.EnsureSchemaAsync(c, ct).ConfigureAwait(false);
+        await MailStoreSchema.EnsureAsync(c, ct).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -97,8 +98,17 @@ public sealed class AccountRepository
         await c.OpenAsync(ct).ConfigureAwait(false);
         using var cmd = c.CreateCommand();
         cmd.CommandText = @"
-            INSERT OR REPLACE INTO Accounts (Id, Email, Provider, ImapServer, ImapPort, SmtpServer, SmtpPort, Password, OAuthToken, RefreshToken, TokenExpiration, ProxyType, ProxyHost, ProxyPort, CredentialVersion, AuthType)
-            VALUES ($Id, $Email, $Provider, $ImapServer, $ImapPort, $SmtpServer, $SmtpPort, '', '', '', $TokenExpiration, $ProxyType, $ProxyHost, $ProxyPort, $CredentialVersion, $AuthType)";
+            INSERT INTO Accounts (Id, Email, Provider, ImapServer, ImapPort, SmtpServer, SmtpPort, Password, OAuthToken, RefreshToken, TokenExpiration, ProxyType, ProxyHost, ProxyPort, CredentialVersion, AuthType)
+            VALUES ($Id, $Email, $Provider, $ImapServer, $ImapPort, $SmtpServer, $SmtpPort, '', '', '', $TokenExpiration, $ProxyType, $ProxyHost, $ProxyPort, $CredentialVersion, $AuthType)
+            ON CONFLICT(Id) DO UPDATE SET
+                Email = excluded.Email, Provider = excluded.Provider,
+                ImapServer = excluded.ImapServer, ImapPort = excluded.ImapPort,
+                SmtpServer = excluded.SmtpServer, SmtpPort = excluded.SmtpPort,
+                Password = '', OAuthToken = '', RefreshToken = '', TokenExpiration = excluded.TokenExpiration,
+                ProxyType = excluded.ProxyType, ProxyHost = excluded.ProxyHost, ProxyPort = excluded.ProxyPort,
+                CredentialVersion = excluded.CredentialVersion, AuthType = excluded.AuthType";
+        // 注意：不用 INSERT OR REPLACE。REPLACE 会先删除旧行，若将来给 Emails 外键加 ON DELETE CASCADE，
+        // 编辑账号（改代理等）就会把该账号的本地邮件全部清空。UPSERT 原地更新，不触发删除。
         cmd.Parameters.AddWithValue("$Id", account.Id);
         cmd.Parameters.AddWithValue("$Email", account.Email);
         cmd.Parameters.AddWithValue("$Provider", account.Provider);
@@ -195,20 +205,179 @@ public sealed class AccountRepository
         return results;
     }
 
-    /// <summary>删除账号行及其全部凭据。</summary>
-    public async Task DeleteAsync(string accountId, CancellationToken ct = default)
+    /// <summary>
+    /// 删除账号（只删本地数据，不会删除邮箱服务器上的邮件）：
+    ///  1. 在一个 SQLite 事务中先删该账号的 Emails（删除触发器同步 FTS5），再删 Accounts 行；
+    ///     任一步失败整体回滚，账号、邮件、凭据保持原样并抛出异常。
+    ///  2. 事务提交后再删 DPAPI 凭据和本地正文缓存（只删应用缓存目录内的文件）。
+    ///     这一步失败不会回滚数据库，而是写入 PendingCleanup，下次启动由 <see cref="RetryPendingCleanupAsync"/> 重试，
+    ///     并在结果中如实报告"未完全清理"。
+    /// </summary>
+    public async Task<AccountDeletionResult> DeleteAsync(string accountId, AppFileCache? bodyCache = null, CancellationToken ct = default)
     {
+        var bodyPaths = new List<string>();
+        int emailsDeleted;
+
+        using (var c = new SqliteConnection(_connectionString))
+        {
+            await c.OpenAsync(ct).ConfigureAwait(false);
+            using var tx = c.BeginTransaction();
+            try
+            {
+                using (var q = c.CreateCommand())
+                {
+                    q.Transaction = tx;
+                    q.CommandText = "SELECT BodyLocalPath FROM Emails WHERE AccountId = $Id AND IFNULL(BodyLocalPath, '') <> ''";
+                    q.Parameters.AddWithValue("$Id", accountId);
+                    using var r = await q.ExecuteReaderAsync(ct).ConfigureAwait(false);
+                    while (await r.ReadAsync(ct).ConfigureAwait(false)) bodyPaths.Add(r.GetString(0));
+                }
+
+                using (var del = c.CreateCommand())
+                {
+                    del.Transaction = tx;
+                    del.CommandText = "DELETE FROM Emails WHERE AccountId = $Id";
+                    del.Parameters.AddWithValue("$Id", accountId);
+                    emailsDeleted = await del.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+                }
+
+                using (var del = c.CreateCommand())
+                {
+                    del.Transaction = tx;
+                    del.CommandText = "DELETE FROM Accounts WHERE Id = $Id";
+                    del.Parameters.AddWithValue("$Id", accountId);
+                    await del.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+                }
+
+                await tx.CommitAsync(ct).ConfigureAwait(false);
+            }
+            catch
+            {
+                await tx.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                throw;
+            }
+        }
+
+        // ---- 数据库已提交：清理凭据与文件，失败记入 PendingCleanup ----
+        var pending = new List<(string Kind, string Target)>();
+        var credentialsDeleted = true;
+        try
+        {
+            await _secrets.DeleteAllAsync(accountId, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            credentialsDeleted = false;
+            pending.Add((CleanupKinds.Credentials, accountId));
+        }
+
+        var filesDeleted = 0;
+        if (bodyCache != null)
+        {
+            foreach (var path in bodyPaths.Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                if (!bodyCache.IsInside(path))
+                    continue; // 不属于应用缓存目录的路径一律不碰
+                if (bodyCache.TryDeleteFile(path, out _)) filesDeleted++;
+                else pending.Add((CleanupKinds.File, path));
+            }
+            var dir = bodyCache.AccountDirectory(accountId);
+            if (!bodyCache.TryDeleteDirectory(dir, out _))
+                pending.Add((CleanupKinds.Directory, dir));
+        }
+
+        if (pending.Count > 0)
+            await AddPendingCleanupAsync(accountId, pending, ct).ConfigureAwait(false);
+
+        return new AccountDeletionResult(emailsDeleted, credentialsDeleted, filesDeleted, pending.Select(p => $"{p.Kind}:{p.Target}").ToList());
+    }
+
+    /// <summary>重试上次未完成的清理（凭据 / 缓存文件）。返回仍未完成的条数。</summary>
+    public async Task<int> RetryPendingCleanupAsync(AppFileCache? bodyCache = null, CancellationToken ct = default)
+    {
+        var items = new List<(long Id, string AccountId, string Kind, string Target)>();
         using (var c = new SqliteConnection(_connectionString))
         {
             await c.OpenAsync(ct).ConfigureAwait(false);
             using var cmd = c.CreateCommand();
-            cmd.CommandText = "DELETE FROM Accounts WHERE Id = $Id";
-            cmd.Parameters.AddWithValue("$Id", accountId);
+            cmd.CommandText = "SELECT Id, AccountId, Kind, Target FROM PendingCleanup ORDER BY Id";
+            using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+            while (await r.ReadAsync(ct).ConfigureAwait(false))
+                items.Add((r.GetInt64(0), r.GetString(1), r.GetString(2), r.GetString(3)));
+        }
+
+        var done = new List<long>();
+        foreach (var item in items)
+        {
+            var ok = false;
+            switch (item.Kind)
+            {
+                case CleanupKinds.Credentials:
+                    try { await _secrets.DeleteAllAsync(item.AccountId, ct).ConfigureAwait(false); ok = true; }
+                    catch (Exception ex) when (ex is not OperationCanceledException) { }
+                    break;
+                case CleanupKinds.File:
+                    ok = bodyCache != null && (!bodyCache.IsInside(item.Target) || bodyCache.TryDeleteFile(item.Target, out _));
+                    break;
+                case CleanupKinds.Directory:
+                    ok = bodyCache != null && (!bodyCache.IsInside(item.Target) || bodyCache.TryDeleteDirectory(item.Target, out _));
+                    break;
+                default:
+                    ok = true; // 未知类型直接丢弃
+                    break;
+            }
+            if (ok) done.Add(item.Id);
+        }
+
+        if (done.Count > 0)
+        {
+            using var c = new SqliteConnection(_connectionString);
+            await c.OpenAsync(ct).ConfigureAwait(false);
+            foreach (var id in done)
+            {
+                using var cmd = c.CreateCommand();
+                cmd.CommandText = "DELETE FROM PendingCleanup WHERE Id = $Id";
+                cmd.Parameters.AddWithValue("$Id", id);
+                await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+            }
+        }
+        return items.Count - done.Count;
+    }
+
+    private async Task AddPendingCleanupAsync(string accountId, List<(string Kind, string Target)> items, CancellationToken ct)
+    {
+        using var c = new SqliteConnection(_connectionString);
+        await c.OpenAsync(ct).ConfigureAwait(false);
+        using (var ensure = c.CreateCommand())
+        {
+            ensure.CommandText = MailStoreSchema.PendingCleanupTableSql;
+            await ensure.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        foreach (var (kind, target) in items)
+        {
+            using var cmd = c.CreateCommand();
+            cmd.CommandText = "INSERT INTO PendingCleanup (AccountId, Kind, Target, CreatedAt) VALUES ($A, $K, $T, $C)";
+            cmd.Parameters.AddWithValue("$A", accountId);
+            cmd.Parameters.AddWithValue("$K", kind);
+            cmd.Parameters.AddWithValue("$T", target);
+            cmd.Parameters.AddWithValue("$C", DateTimeOffset.UtcNow.ToString("o"));
             await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
         }
-        await _secrets.DeleteAllAsync(accountId, ct).ConfigureAwait(false);
     }
 
     /// <summary>只删除凭据（行已由其它语句删除时使用）。</summary>
     public Task DeleteCredentialsAsync(string accountId, CancellationToken ct = default) => _secrets.DeleteAllAsync(accountId, ct);
+}
+
+public static class CleanupKinds
+{
+    public const string Credentials = "credentials";
+    public const string File = "file";
+    public const string Directory = "directory";
+}
+
+/// <summary>删除账号的结果。<see cref="FullyCleaned"/> 为 false 时，不得向用户报告"全部清理成功"。</summary>
+public sealed record AccountDeletionResult(int EmailsDeleted, bool CredentialsDeleted, int FilesDeleted, IReadOnlyList<string> PendingCleanup)
+{
+    public bool FullyCleaned => CredentialsDeleted && PendingCleanup.Count == 0;
 }

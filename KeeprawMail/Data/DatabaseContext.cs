@@ -4,6 +4,8 @@ using Microsoft.Data.Sqlite;
 using System;
 using System.IO;
 using System.Threading.Tasks;
+using System.Linq;
+using System.Collections.Generic;
 
 namespace KeeprawMail.Data
 {
@@ -112,55 +114,9 @@ namespace KeeprawMail.Data
             // 1. 创建 Accounts 表（建表语句与 Core 中的 AccountRepository 共用）
             await ExecuteNonQueryAsync(connection, AccountRepository.CreateTableSql);
 
-            // 2. 创建 Emails 表 (主表)
-            var createEmailsTable = @"
-                CREATE TABLE IF NOT EXISTS Emails (
-                    Id TEXT PRIMARY KEY,
-                    Subject TEXT,
-                    SenderName TEXT,
-                    SenderAddress TEXT,
-                    Date TEXT,
-                    Snippet TEXT,
-                    BodyLocalPath TEXT,
-                    IsRead INTEGER,
-                    Mailbox TEXT,
-                    AccountId TEXT,
-                    IsStarred INTEGER DEFAULT 0,
-                    FOREIGN KEY(AccountId) REFERENCES Accounts(Id)
-                );";
-            await ExecuteNonQueryAsync(connection, createEmailsTable);
-
-            // 3. 创建 FTS5 虚拟表 (用于全文搜索)
-            // 我们只索引需要搜索的字段：Subject, SenderName, SenderAddress, Snippet
-            // 注意：FTS5 表是独立的，我们需要维护它与主表的数据同步 (或使用触发器)
-            var createFtsTable = @"
-                CREATE VIRTUAL TABLE IF NOT EXISTS Emails_FTS USING fts5(
-                    Subject, 
-                    SenderName, 
-                    SenderAddress, 
-                    Snippet, 
-                    content='Emails', 
-                    content_rowid='rowid'
-                );";
-            await ExecuteNonQueryAsync(connection, createFtsTable);
-
-            // 4. 创建触发器：当 Emails 表插入数据时，自动同步到 FTS 表
-            var createInsertTrigger = @"
-                CREATE TRIGGER IF NOT EXISTS Emails_ai AFTER INSERT ON Emails BEGIN
-                    INSERT INTO Emails_FTS(rowid, Subject, SenderName, SenderAddress, Snippet) 
-                    VALUES (new.rowid, new.Subject, new.SenderName, new.SenderAddress, new.Snippet);
-                END;";
-            await ExecuteNonQueryAsync(connection, createInsertTrigger);
-
-            // 5. 创建触发器：当 Emails 表删除数据时，自动从 FTS 表删除
-            var createDeleteTrigger = @"
-                CREATE TRIGGER IF NOT EXISTS Emails_ad AFTER DELETE ON Emails BEGIN
-                    INSERT INTO Emails_FTS(Emails_FTS, rowid, Subject, SenderName, SenderAddress, Snippet) 
-                    VALUES('delete', old.rowid, old.Subject, old.SenderName, old.SenderAddress, old.Snippet);
-                END;";
-            await ExecuteNonQueryAsync(connection, createDeleteTrigger);
-            
-            // Update 触发器略过，MVP 阶段邮件内容通常不变，状态改变不影响搜索
+            // 2-5. Emails 表、FTS5 虚拟表与同步触发器、PendingCleanup（定义见 Core.Storage.MailStoreSchema，测试共用同一份）
+            //      注意：MailStoreSchema 在结构版本升级时会重建一次 FTS，清除历史 INSERT OR REPLACE 留下的残留条目。
+            await MailStoreSchema.EnsureAsync(connection);
 
             // 6. 创建 AppSettings 表 (应用级设置存储)
             // 使用 Key-Value 结构，灵活易扩展
@@ -259,88 +215,47 @@ namespace KeeprawMail.Data
             await command.ExecuteNonQueryAsync();
         }
 
+        private EmailStore Emails => new(ConnectionString);
+
         /// <summary>
-        /// 批量保存邮件到数据库
-        /// 如果已存在则忽略 (INSERT OR IGNORE) 或 更新
+        /// 批量保存邮件（UPSERT，FTS 由触发器同步）。
         /// </summary>
-        public async Task SaveEmailsAsync(IEnumerable<Models.EmailMessage> emails)
-        {
-            using var connection = GetConnection();
-            await connection.OpenAsync();
-            using var transaction = connection.BeginTransaction();
-
-            var command = connection.CreateCommand();
-            command.Transaction = transaction;
-            command.CommandText = @"
-                INSERT OR REPLACE INTO Emails (Id, Subject, SenderName, SenderAddress, Date, Snippet, BodyLocalPath, IsRead, Mailbox, AccountId, IsStarred)
-                VALUES ($Id, $Subject, $SenderName, $SenderAddress, $Date, $Snippet, $BodyLocalPath, $IsRead, $Mailbox, $AccountId, $IsStarred)";
-
-            // 预定义参数
-            var pId = command.Parameters.Add("$Id", SqliteType.Text);
-            var pSubject = command.Parameters.Add("$Subject", SqliteType.Text);
-            var pSenderName = command.Parameters.Add("$SenderName", SqliteType.Text);
-            var pSenderAddress = command.Parameters.Add("$SenderAddress", SqliteType.Text);
-            var pDate = command.Parameters.Add("$Date", SqliteType.Text);
-            var pSnippet = command.Parameters.Add("$Snippet", SqliteType.Text);
-            var pBodyLocalPath = command.Parameters.Add("$BodyLocalPath", SqliteType.Text);
-            var pIsRead = command.Parameters.Add("$IsRead", SqliteType.Integer);
-            var pMailbox = command.Parameters.Add("$Mailbox", SqliteType.Text);
-            var pAccountId = command.Parameters.Add("$AccountId", SqliteType.Text);
-            var pIsStarred = command.Parameters.Add("$IsStarred", SqliteType.Integer);
-
-            foreach (var email in emails)
+        public Task SaveEmailsAsync(IEnumerable<Models.EmailMessage> emails) =>
+            Emails.SaveAsync(emails.Select(e => new StoredEmail
             {
-                pId.Value = email.Id;
-                pSubject.Value = email.Subject ?? "";
-                pSenderName.Value = email.SenderName ?? "";
-                pSenderAddress.Value = email.SenderAddress ?? "";
-                pDate.Value = email.Date.ToString("o"); // ISO 8601
-                pSnippet.Value = email.Snippet ?? "";
-                pBodyLocalPath.Value = email.BodyLocalPath ?? "";
-                pIsRead.Value = email.IsRead ? 1 : 0;
-                pMailbox.Value = email.Mailbox ?? "Inbox";
-                pAccountId.Value = email.AccountId ?? "";
-                command.Parameters["$IsStarred"].Value = email.IsStarred ? 1 : 0;
-
-                await command.ExecuteNonQueryAsync();
-            }
-
-            await transaction.CommitAsync();
-        }
+                Id = e.Id,
+                Subject = e.Subject ?? "",
+                SenderName = e.SenderName ?? "",
+                SenderAddress = e.SenderAddress ?? "",
+                Date = e.Date,
+                Snippet = e.Snippet ?? "",
+                BodyLocalPath = e.BodyLocalPath ?? "",
+                IsRead = e.IsRead,
+                Mailbox = e.Mailbox ?? "Inbox",
+                AccountId = e.AccountId ?? "",
+                IsStarred = e.IsStarred,
+            }).ToList());
 
         /// <summary>
-        /// 获取所有邮件 (按日期倒序)
+        /// 获取列表邮件：每个账号各取最近 100 封（避免某个账号的大量新邮件把其它账号挤出列表），整体按日期倒序。
         /// </summary>
         public async Task<System.Collections.Generic.List<Models.EmailMessage>> GetEmailsAsync()
         {
-            var results = new System.Collections.Generic.List<Models.EmailMessage>();
-            
-            using var connection = GetConnection();
-            await connection.OpenAsync();
-
-            var command = connection.CreateCommand();
-            command.CommandText = "SELECT * FROM Emails ORDER BY Date DESC LIMIT 100";
-
-            using var reader = await command.ExecuteReaderAsync();
-            while (await reader.ReadAsync())
+            var rows = await Emails.GetRecentAsync(EmailStore.DefaultPerAccountLimit);
+            return rows.Select(r => new Models.EmailMessage
             {
-                results.Add(new Models.EmailMessage
-                {
-                    Id = reader.GetString(0),
-                    Subject = reader.IsDBNull(1) ? "" : reader.GetString(1),
-                    SenderName = reader.IsDBNull(2) ? "" : reader.GetString(2),
-                    SenderAddress = reader.IsDBNull(3) ? "" : reader.GetString(3),
-                    Date = DateTimeOffset.Parse(reader.GetString(4)),
-                    Snippet = reader.IsDBNull(5) ? "" : reader.GetString(5),
-                    BodyLocalPath = reader.IsDBNull(6) ? "" : reader.GetString(6),
-                    IsRead = reader.GetInt32(7) == 1,
-                    Mailbox = reader.IsDBNull(8) ? "" : reader.GetString(8),
-                    AccountId = reader.IsDBNull(9) ? "" : reader.GetString(9),
-                    IsStarred = !reader.IsDBNull(10) && reader.GetInt32(10) == 1
-                });
-            }
-
-            return results;
+                Id = r.Id,
+                Subject = r.Subject,
+                SenderName = r.SenderName,
+                SenderAddress = r.SenderAddress,
+                Date = r.Date,
+                Snippet = r.Snippet,
+                BodyLocalPath = r.BodyLocalPath,
+                IsRead = r.IsRead,
+                Mailbox = r.Mailbox,
+                AccountId = r.AccountId,
+                IsStarred = r.IsStarred,
+            }).ToList();
         }
 
         /// <summary>
@@ -410,9 +325,14 @@ namespace KeeprawMail.Data
         };
 
         /// <summary>
-        /// 删除账号（连同安全存储中的凭据）。
+        /// 删除账号：事务内先删该账号的本地邮件再删账号行（失败整体回滚），
+        /// 提交后再清理 DPAPI 凭据与正文缓存；清理失败记入 PendingCleanup，下次启动重试。
+        /// 不会删除邮箱服务器上的邮件。
         /// </summary>
-        public Task DeleteAccountAsync(string accountId) => Accounts.DeleteAsync(accountId);
+        public Task<AccountDeletionResult> DeleteAccountAsync(string accountId) => Accounts.DeleteAsync(accountId, AppPaths.BodyCache);
+
+        /// <summary>重试上次未完成的删除清理，返回仍未完成的条数。</summary>
+        public Task<int> RetryPendingCleanupAsync() => Accounts.RetryPendingCleanupAsync(AppPaths.BodyCache);
 
         /// <summary>删除账号在安全存储中的全部凭据。</summary>
         private async Task DeleteCredentialsAsync(string accountId)
@@ -452,26 +372,18 @@ namespace KeeprawMail.Data
         /// </summary>
         public async Task CleanupDuplicateAccountsAsync()
         {
-            using var connection = GetConnection();
-            await connection.OpenAsync();
+            System.Collections.Generic.List<string> duplicateIds;
+            using (var connection = GetConnection())
+            {
+                await connection.OpenAsync();
+                duplicateIds = await QueryIdsAsync(connection, @"
+                    SELECT Id FROM Accounts
+                    WHERE rowid NOT IN (SELECT MAX(rowid) FROM Accounts GROUP BY Email)");
+            }
 
-            var duplicateIds = await QueryIdsAsync(connection, @"
-                SELECT Id FROM Accounts
-                WHERE rowid NOT IN (SELECT MAX(rowid) FROM Accounts GROUP BY Email)");
-
-            var command = connection.CreateCommand();
-            command.CommandText = @"
-                DELETE FROM Accounts 
-                WHERE rowid NOT IN (
-                    SELECT MAX(rowid) 
-                    FROM Accounts 
-                    GROUP BY Email
-                )";
-            
-            await command.ExecuteNonQueryAsync();
-
+            // 重复账号的本地邮件随之删除（事务内先删邮件再删账号，避免外键错误）；保留的账号下次同步会重新拉取
             foreach (var id in duplicateIds)
-                await DeleteCredentialsAsync(id);
+                await Accounts.DeleteAsync(id, AppPaths.BodyCache);
         }
 
         /// <summary>

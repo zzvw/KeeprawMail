@@ -22,10 +22,26 @@ namespace KeeprawMail
         {
             try
             {
+                // 0. 诊断日志（已脱敏，不含 Token / 密码 / 正文）
+                KeeprawMail.Core.Sync.DiagnosticLog.FilePath = Data.AppPaths.DiagnosticLogPath;
+                KeeprawMail.Core.Sync.DiagnosticLog.Write("app", "launch");
+
                 // 1. 初始化数据库
                 System.Diagnostics.Debug.WriteLine("==> 开始初始化数据库...");
                 var dbContext = new Data.DatabaseContext();
                 await dbContext.InitializeAsync();
+
+                // 1.1 重试上次删除账号时未完成的凭据 / 缓存清理；清空上次运行留下的阅读器页面
+                try
+                {
+                    var left = await dbContext.RetryPendingCleanupAsync();
+                    if (left > 0) KeeprawMail.Core.Sync.DiagnosticLog.Write("app", $"pending cleanup still left: {left}");
+                    Views.MailPage.CleanupReaderCache();
+                }
+                catch (Exception cleanupEx)
+                {
+                    KeeprawMail.Core.Sync.DiagnosticLog.Write("app", $"startup cleanup failed: {cleanupEx.GetType().Name}");
+                }
                 System.Diagnostics.Debug.WriteLine("==> 数据库初始化完成");
 
                 // 2. 初始化 SettingsService

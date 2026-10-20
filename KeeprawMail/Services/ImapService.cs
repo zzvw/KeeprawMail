@@ -1,5 +1,6 @@
 using KeeprawMail.Models;
 using KeeprawMail.Core.Networking;
+using KeeprawMail.Core.Sync;
 using MailKit;
 using MailKit.Net.Imap;
 using MailKit.Security;
@@ -47,20 +48,32 @@ namespace KeeprawMail.Services
 
             _accountId = account.Id;
 
-            // 1. 代理 + TLS 策略（恢复证书吊销检查，见 TlsPolicy）
-            var proxy = await AppServices.ResolveProxyAsync(account);
+            // 1. 解析代理（全局 / 继承 / 直连 / 覆盖）
+            ProxyEndpoint proxy;
+            try
+            {
+                proxy = await AppServices.ResolveProxyAsync(account);
+            }
+            catch (Exception ex)
+            {
+                throw new MailSyncException(SyncStage.ResolveProxy, $"{account.Email} 的代理配置无效：{ex.Message}", ex);
+            }
             NetworkClientFactory.ConfigureMailClient(_client, proxy);
-            System.Diagnostics.Debug.WriteLine($"[ImapService] {account.Email} via {proxy}");
+            _client.Timeout = 30000;
+            DiagnosticLog.Write("imap", $"{account.Email} connect {account.ImapServer}:{account.ImapPort} via {proxy.Kind} {proxy.Host}:{proxy.Port}");
 
-            // 2. 连接：993 隐式 TLS；其它端口强制 STARTTLS
+            // 2. TCP（经代理）+ TLS：993 隐式 TLS；其它端口强制 STARTTLS
             var sslOptions = account.ImapPort == 993
                 ? SecureSocketOptions.SslOnConnect
                 : SecureSocketOptions.StartTls;
+            await MailConnectionDiagnostics.ConnectAsync(_client, account.ImapServer, account.ImapPort, sslOptions, proxy, cancellationToken);
+            DiagnosticLog.Write("imap", $"{account.Email} connected, tls={_client.IsSecure}");
 
-            await _client.ConnectAsync(account.ImapServer, account.ImapPort, sslOptions, cancellationToken);
-
-            // 3. 认证（OAuth 或密码）
-            await AppServices.AuthenticateAsync(_client, account, proxy, cancellationToken);
+            // 3. 认证（OAuth XOAUTH2 或密码）
+            await MailConnectionDiagnostics.AuthenticateAsync(
+                () => AppServices.AuthenticateAsync(_client, account, proxy, cancellationToken),
+                account.Email, account.IsOAuth, cancellationToken);
+            DiagnosticLog.Write("imap", $"{account.Email} authenticated ({(account.IsOAuth ? "XOAUTH2" : "password")})");
         }
 
         /// <summary>
@@ -69,6 +82,8 @@ namespace KeeprawMail.Services
         public Task<List<string>> GetFoldersToSyncAsync()
         {
             var folders = new List<string>();
+            if (_client.Inbox == null)
+                throw new MailSyncException(SyncStage.ListFolders, "服务器没有返回收件箱（INBOX）。");
 
             AddFolderIfFound(folders, _client.Inbox);
             AddSpecialFolderIfFound(folders, SpecialFolder.Sent);

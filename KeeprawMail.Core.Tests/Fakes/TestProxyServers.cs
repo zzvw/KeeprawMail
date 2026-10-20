@@ -145,6 +145,9 @@ public sealed class TestSocks5Proxy : TestProxyBase
 {
     public int RejectedNonSocks;
 
+    /// <summary>为 true 时只接受用户名/密码认证（方法 0x02）；客户端不提供时回 0xFF（无可接受方法）。</summary>
+    public bool RequireAuth { get; set; }
+
     protected override async Task HandleAsync(NetworkStream s, CancellationToken ct)
     {
         var hdr = new byte[2];
@@ -156,6 +159,11 @@ public sealed class TestSocks5Proxy : TestProxyBase
         }
         var methods = new byte[hdr[1]];
         await s.ReadExactlyAsync(methods, ct);
+        if (RequireAuth)
+        {
+            await s.WriteAsync(new byte[] { 0x05, 0xFF }, ct);
+            return;
+        }
         await s.WriteAsync(new byte[] { 0x05, 0x00 }, ct);
 
         var req = new byte[4];
@@ -178,7 +186,16 @@ public sealed class TestSocks5Proxy : TestProxyBase
 
         var local = Resolve(host, port);
         using var upstream = new TcpClient();
-        await upstream.ConnectAsync(IPAddress.Loopback, local, ct);
+        try
+        {
+            await upstream.ConnectAsync(IPAddress.Loopback, local, ct);
+        }
+        catch (SocketException)
+        {
+            // REP=0x05：目标拒绝连接（Connection refused）
+            await s.WriteAsync(new byte[] { 0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0 }, ct);
+            return;
+        }
         await s.WriteAsync(new byte[] { 0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0 }, ct);
         await PipeAsync(s, upstream.GetStream(), ct);
     }
