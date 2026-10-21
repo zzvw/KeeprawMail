@@ -185,7 +185,7 @@ namespace KeeprawMail.Views
                 await App.SettingsService.SaveGlobalProxyAsync(proxyConfig);
 
                 // 显示成功提示
-                await ShowSuccessDialog("保存成功", "全局代理设置已保存，新添加的账号将使用此配置");
+                await ShowSuccessDialog("保存成功", "全局代理设置已保存，所有选择“Use Global Settings”的账号会立即使用此配置");
 
                 System.Diagnostics.Debug.WriteLine($"全局代理已保存: {proxyType} {proxyConfig.Host}:{proxyConfig.Port}");
             }
@@ -264,6 +264,7 @@ namespace KeeprawMail.Views
                         Header = "Proxy Type",
                         HorizontalAlignment = HorizontalAlignment.Stretch
                     };
+                    proxyTypeCombo.Items.Add(new ComboBoxItem { Content = "Use Global Settings", Tag = "GLOBAL" });
                     proxyTypeCombo.Items.Add(new ComboBoxItem { Content = "None (Direct Connection)", Tag = "NONE" });
                     proxyTypeCombo.Items.Add(new ComboBoxItem { Content = "HTTP", Tag = "HTTP" });
                     proxyTypeCombo.Items.Add(new ComboBoxItem { Content = "SOCKS5", Tag = "SOCKS5" });
@@ -288,7 +289,7 @@ namespace KeeprawMail.Views
                     var proxyPortBox = new NumberBox
                     {
                         Header = "Proxy Port",
-                        Value = account.ProxyPort,
+                        Value = account.ProxyPort > 0 ? account.ProxyPort : 7890,
                         Minimum = 1,
                         Maximum = 65535,
                         SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Inline
@@ -297,7 +298,8 @@ namespace KeeprawMail.Views
                     // 根据代理类型启用/禁用输入框
                     void UpdateInputState()
                     {
-                        var isEnabled = proxyTypeCombo.SelectedItem is ComboBoxItem item && item.Tag?.ToString() != "NONE";
+                        var tag = (proxyTypeCombo.SelectedItem as ComboBoxItem)?.Tag?.ToString();
+                        var isEnabled = tag == "HTTP" || tag == "SOCKS5";
                         proxyHostBox.IsEnabled = isEnabled;
                         proxyPortBox.IsEnabled = isEnabled;
                     }
@@ -316,20 +318,28 @@ namespace KeeprawMail.Views
                     if (result == ContentDialogResult.Primary)
                     {
                         var selectedItem = proxyTypeCombo.SelectedItem as ComboBoxItem;
-                        var newProxyType = selectedItem?.Tag?.ToString() ?? "NONE";
+                        var newProxyType = selectedItem?.Tag?.ToString() ?? "GLOBAL";
                         var newProxyHost = proxyHostBox.Text.Trim();
                         var newProxyPort = (int)proxyPortBox.Value;
 
-                        // 验证输入
-                        if (newProxyType != "NONE")
+                        // 验证输入（HTTP / SOCKS5 必须有合法主机和端口）
+                        if (newProxyType == "HTTP" || newProxyType == "SOCKS5")
                         {
-                            if (string.IsNullOrWhiteSpace(newProxyHost))
+                            try
                             {
-                                await ShowErrorDialog("验证失败", "代理主机不能为空");
-                                // 理想情况下应该阻止对话框关闭，或者重新打开对话框
-                                // 这里简单处理：不保存，用户需要重新操作
+                                KeeprawMail.Core.Networking.AccountProxySettings
+                                    .FromStored(newProxyType, newProxyHost, newProxyPort).Override!.Validate();
+                            }
+                            catch (KeeprawMail.Core.Networking.ProxyConfigurationException ex)
+                            {
+                                await ShowErrorDialog("验证失败", ex.Message);
                                 return;
                             }
+                        }
+                        else
+                        {
+                            newProxyHost = string.Empty;
+                            newProxyPort = 0;
                         }
 
                         // 更新账号代理设置
@@ -354,6 +364,66 @@ namespace KeeprawMail.Views
             }
         }
         /// <summary>
+        /// 重新授权按钮点击事件：Refresh Token 失效时，不删除账号即可重新完成 Google 授权。
+        /// 授权返回的邮箱必须与该账号一致，否则拒绝保存。
+        /// </summary>
+        private async void ReauthorizeAccount_Click(object sender, RoutedEventArgs e)
+        {
+            if (sender is not Button button || button.Tag is not string accountId)
+                return;
+
+            button.IsEnabled = false;
+            try
+            {
+                var dbContext = new Data.DatabaseContext();
+                var account = (await dbContext.GetAccountsAsync()).FirstOrDefault(a => a.Id == accountId);
+                if (account == null)
+                {
+                    await ShowErrorDialog("错误", "找不到该账号");
+                    return;
+                }
+
+                await Services.AppServices.ReauthorizeGmailAsync(account);
+
+                // 重新授权只证明新 Token 已获取并保存，不代表已经能收信：提示并让用户立即做一次受控同步
+                var next = new ContentDialog
+                {
+                    Title = "授权已更新",
+                    Content = $"{account.Email} 的新授权已保存（账号、代理设置和本地邮件均保留）。\n\n" +
+                              "这一步还没有连接邮箱服务器。是否立即同步该账号，验证能否正常收信？",
+                    PrimaryButtonText = "立即同步",
+                    CloseButtonText = "稍后",
+                    DefaultButton = ContentDialogButton.Primary,
+                    XamlRoot = this.Content.XamlRoot
+                };
+                if (await next.ShowAsync() == ContentDialogResult.Primary)
+                {
+                    var report = await App.MainViewModel.SyncSingleAccountAsync(account.Id);
+                    if (report.Status == KeeprawMail.Core.Sync.AccountSyncStatus.Failed)
+                        await ShowErrorDialog("同步失败", report.Describe());
+                    else
+                        await ShowSuccessDialog(report.Status == KeeprawMail.Core.Sync.AccountSyncStatus.Success ? "同步成功" : "部分成功", report.Describe());
+                }
+            }
+            catch (KeeprawMail.Core.Auth.OAuthAccountMismatchException ex)
+            {
+                await ShowErrorDialog("账号不一致", ex.Message);
+            }
+            catch (KeeprawMail.Core.Auth.OAuthUserCancelledException ex)
+            {
+                await ShowErrorDialog("已取消", ex.Message);
+            }
+            catch (Exception ex)
+            {
+                await ShowErrorDialog("重新授权失败", ex.Message);
+            }
+            finally
+            {
+                button.IsEnabled = true;
+            }
+        }
+
+        /// <summary>
         /// 删除账号按钮点击事件
         /// </summary>
         private async void DeleteAccount_Click(object sender, RoutedEventArgs e)
@@ -377,19 +447,27 @@ namespace KeeprawMail.Views
                     if (result == ContentDialogResult.Primary)
                     {
                         var dbContext = new Data.DatabaseContext();
-                        await dbContext.DeleteAccountAsync(accountId);
-                        
-                        // 重新加载账号列表
+                        // 事务内删除本地邮件与账号；失败会抛出并回滚，账号与凭据保持可用
+                        var deletion = await dbContext.DeleteAccountAsync(accountId);
+
+                        // 刷新设置页账号列表与主界面账号 / 邮件列表
                         await LoadAccountsAsync();
-                        
-                        await ShowSuccessDialog("成功", "账号已删除");
+                        await App.MainViewModel.LoadLocalEmailsAsync();
+
+                        if (deletion.FullyCleaned)
+                            await ShowSuccessDialog("成功", $"账号已删除，同时删除了 {deletion.EmailsDeleted} 封本地邮件（服务器上的邮件不受影响）。");
+                        else
+                            await ShowErrorDialog("账号已删除，但清理未全部完成",
+                                $"账号和 {deletion.EmailsDeleted} 封本地邮件已从数据库删除；" +
+                                (deletion.CredentialsDeleted ? "" : "保存的凭据暂未删除；") +
+                                $"{deletion.PendingCleanup.Count} 项本地清理未完成，下次启动会自动重试。");
                     }
                 }
             }
             catch (Exception ex)
             {
-                System.Diagnostics.Debug.WriteLine($"删除账号失败: {ex.Message}");
-                await ShowErrorDialog("失败", ex.Message);
+                KeeprawMail.Core.Sync.DiagnosticLog.Write("account", $"delete failed: {ex.GetType().Name}: {ex.Message}");
+                await ShowErrorDialog("删除失败", $"数据库操作已回滚，账号、本地邮件和凭据均保持可用。\n{ex.Message}");
             }
         }
     }

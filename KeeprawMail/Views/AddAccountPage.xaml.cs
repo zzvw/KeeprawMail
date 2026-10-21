@@ -1,5 +1,6 @@
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using KeeprawMail.Core.Networking;
 using KeeprawMail.Models;
 using System;
 using System.Collections.Generic;
@@ -185,13 +186,14 @@ namespace KeeprawMail.Views
                     ImapPort = (int)ImapPortNumberBox.Value,
                     SmtpServer = SmtpServerTextBox.Text.Trim(),
                     SmtpPort = (int)SmtpPortNumberBox.Value,
+                    AuthType = KeeprawMail.Core.Storage.AccountAuthTypes.Password,
                     Password = PasswordBox.Password
                 };
 
                 // 处理代理配置
-                await ApplyProxySettingsAsync(account);
+                ApplyProxySettings(account, BuildAccountProxySettings());
 
-                // 保存到数据库
+                // 保存（密码进入安全存储）
                 await _dbContext.SaveAccountAsync(account);
 
                 // 导航回上一页
@@ -207,80 +209,106 @@ namespace KeeprawMail.Views
         }
 
         /// <summary>
-        /// OAuth 登录按钮点击事件
+        /// 正在进行的 OAuth 登录（用于取消）。
+        /// </summary>
+        private System.Threading.CancellationTokenSource? _loginCts;
+
+        /// <summary>
+        /// OAuth 登录按钮点击事件。
+        /// 浏览器授权由系统默认浏览器完成（浏览器使用它自己的代理设置）；
+        /// Token 交换与用户信息请求走本页选择的代理（继承全局 / 直连 / 自定义）。
         /// </summary>
         private async void OAuthLoginButton_Click(object sender, RoutedEventArgs e)
         {
+            if (_loginCts != null)
+            {
+                return; // 已在登录中
+            }
+
+            _loginCts = new System.Threading.CancellationTokenSource();
+            OAuthLoginButton.IsEnabled = false;
             try
             {
-                // 1. 解析代理设置
-                string proxyType = "NONE";
-                string proxyHost = "";
-                int proxyPort = 0;
+                // 1. 账号代理设置（GLOBAL 为真正的继承，不再拷贝快照）
+                var accountProxy = BuildAccountProxySettings();
+                var global = await KeeprawMail.Services.AppServices.GetGlobalProxyAsync();
+                var effectiveProxy = ProxyResolver.Resolve(global, accountProxy);
 
-                var selectedProxyItem = AccountProxyTypeComboBox.SelectedItem as ComboBoxItem;
-                var selectedTag = selectedProxyItem?.Tag as string ?? "GLOBAL";
-
-                if (selectedTag == "GLOBAL")
-                {
-                    var globalProxy = await App.SettingsService.GetGlobalProxyAsync();
-                    proxyType = globalProxy.Type;
-                    proxyHost = globalProxy.Host;
-                    proxyPort = globalProxy.Port;
-                }
-                else if (selectedTag == "NONE")
-                {
-                    proxyType = "NONE";
-                }
-                else
-                {
-                    proxyType = selectedTag;
-                    proxyHost = AccountProxyHostTextBox.Text.Trim();
-                    proxyPort = (int)AccountProxyPortNumberBox.Value;
-                }
-
+                // 2. 浏览器授权 + Token 交换
                 var oauthService = new KeeprawMail.Services.OAuthService();
-                // 使用新的返回元组，并传递代理设置
-                var (accessToken, refreshToken, expiration, email) = await oauthService.LoginGmailAsync(proxyType, proxyHost, proxyPort);
+                var login = await oauthService.LoginGmailAsync(
+                    effectiveProxy,
+                    loginHint: string.IsNullOrWhiteSpace(EmailTextBox.Text) ? null : EmailTextBox.Text.Trim(),
+                    cancellationToken: _loginCts.Token);
 
-                // 登录成功，自动填充并保存
+                // 3. 检查是否已存在
+                var existingAccounts = await _dbContext.GetAccountsAsync();
+                var existing = existingAccounts.FirstOrDefault(a => a.Email.Equals(login.Email, StringComparison.OrdinalIgnoreCase));
+                if (existing != null)
+                {
+                    if (existing.Provider != EmailProvider.Gmail)
+                    {
+                        await ShowErrorDialog("该邮箱账号已存在");
+                        return;
+                    }
+
+                    // 已存在的 Gmail 账号：这是一次重新授权。授权返回的邮箱与该账号一致（上面按邮箱匹配），
+                    // 新 Token 写入原 AccountId；账号 ID、代理设置、本地邮件与草稿保持不变。
+                    await KeeprawMail.Services.AppServices.Tokens.SaveAsync(existing.Id, login.Tokens);
+                    if (!existing.IsOAuth)
+                    {
+                        existing.AuthType = KeeprawMail.Core.Storage.AccountAuthTypes.OAuth2;
+                        await _dbContext.SaveAccountAsync(existing);
+                    }
+                    await ShowInfoDialog("已重新授权", "该 Gmail 账号已存在，已用本次授权更新它的登录凭据（账号、代理设置和本地邮件均保留）。");
+                    if (Frame.CanGoBack)
+                    {
+                        Frame.GoBack();
+                    }
+                    return;
+                }
+
+                // 4. 保存：Token 交给安全存储，数据库只存非敏感信息
                 var account = new AccountProfile
                 {
                     Id = Guid.NewGuid().ToString(),
-                    Email = email, // 从 UserInfo 获取的邮箱
+                    Email = login.Email,
                     Provider = EmailProvider.Gmail,
                     ImapServer = "imap.gmail.com",
                     ImapPort = 993,
                     SmtpServer = "smtp.gmail.com",
                     SmtpPort = 587,
-                    Password = "", // OAuth 不需要密码
-                    OAuthToken = accessToken,
-                    RefreshToken = refreshToken, // 现在我们有 Refresh Token 了
-                    TokenExpiration = expiration
+                    AuthType = KeeprawMail.Core.Storage.AccountAuthTypes.OAuth2,
+                    OAuthToken = login.Tokens.AccessToken,
+                    RefreshToken = login.Tokens.RefreshToken,
+                    TokenExpiration = login.Tokens.AccessTokenExpiresAt,
                 };
-
-                // 检查是否已存在
-                var existingAccounts = await _dbContext.GetAccountsAsync();
-                if (existingAccounts.Any(a => a.Email.Equals(account.Email, StringComparison.OrdinalIgnoreCase)))
-                {
-                    await ShowErrorDialog("该邮箱账号已存在");
-                    return;
-                }
-
-                // 处理代理配置
-                await ApplyProxySettingsAsync(account);
+                ApplyProxySettings(account, accountProxy);
 
                 await _dbContext.SaveAccountAsync(account);
-                
-                // 导航回上一页
+
                 if (Frame.CanGoBack)
                 {
                     Frame.GoBack();
                 }
             }
+            catch (OperationCanceledException)
+            {
+                // 用户点了取消/返回，静默结束
+            }
+            catch (KeeprawMail.Core.Auth.OAuthUserCancelledException ex)
+            {
+                await ShowErrorDialog(ex.Message);
+            }
             catch (Exception ex)
             {
                 await ShowErrorDialog($"登录失败：{ex.Message}");
+            }
+            finally
+            {
+                _loginCts?.Dispose();
+                _loginCts = null;
+                OAuthLoginButton.IsEnabled = true;
             }
         }
 
@@ -289,6 +317,7 @@ namespace KeeprawMail.Views
         /// </summary>
         private void CancelButton_Click(object sender, RoutedEventArgs e)
         {
+            _loginCts?.Cancel();
             if (Frame.CanGoBack)
             {
                 Frame.GoBack();
@@ -312,6 +341,18 @@ namespace KeeprawMail.Views
             };
         }
 
+        private async System.Threading.Tasks.Task ShowInfoDialog(string title, string message)
+        {
+            var dialog = new ContentDialog
+            {
+                Title = title,
+                Content = message,
+                CloseButtonText = "确定",
+                XamlRoot = this.Content.XamlRoot
+            };
+            await dialog.ShowAsync();
+        }
+
         private async System.Threading.Tasks.Task ShowErrorDialog(string message)
         {
             var dialog = new ContentDialog
@@ -325,41 +366,23 @@ namespace KeeprawMail.Views
         }
 
         /// <summary>
-        /// 应用代理设置到账号对象
+        /// 读取本页的账号代理选择。
+        /// GLOBAL = 继承全局（全局改了账号跟着变）；NONE = 强制直连；HTTP / SOCKS5 = 覆盖全局。
         /// </summary>
-        private async System.Threading.Tasks.Task ApplyProxySettingsAsync(AccountProfile account)
+        private AccountProxySettings BuildAccountProxySettings()
         {
             var selectedProxyItem = AccountProxyTypeComboBox.SelectedItem as ComboBoxItem;
-            var proxyType = selectedProxyItem?.Tag as string ?? "GLOBAL";
+            var tag = selectedProxyItem?.Tag as string ?? AccountProxySettings.StoredInherit;
+            var settings = AccountProxySettings.FromStored(tag, AccountProxyHostTextBox.Text, (int)AccountProxyPortNumberBox.Value);
+            settings.Override?.Validate();
+            return settings;
+        }
 
-            if (proxyType == "GLOBAL")
-            {
-                // 使用全局代理设置（复制快照）
-                var globalProxy = await App.SettingsService.GetGlobalProxyAsync();
-                account.ProxyType = globalProxy.Type;
-                account.ProxyHost = globalProxy.Host;
-                account.ProxyPort = globalProxy.Port;
-            }
-            else if (proxyType == "NONE")
-            {
-                // 直连（明确设置为 NONE）
-                account.ProxyType = "NONE";
-                account.ProxyHost = string.Empty;
-                account.ProxyPort = 0;
-            }
-            else
-            {
-                // 自定义代理（HTTP 或 SOCKS5）
-                var host = AccountProxyHostTextBox.Text.Trim();
-                if (string.IsNullOrWhiteSpace(host))
-                {
-                    throw new ArgumentException("代理主机不能为空");
-                }
-
-                account.ProxyType = proxyType;
-                account.ProxyHost = host;
-                account.ProxyPort = (int)AccountProxyPortNumberBox.Value;
-            }
+        private static void ApplyProxySettings(AccountProfile account, AccountProxySettings settings)
+        {
+            account.ProxyType = settings.StoredType;
+            account.ProxyHost = settings.Override?.Host ?? string.Empty;
+            account.ProxyPort = settings.Override?.Port ?? 0;
         }
     }
 }

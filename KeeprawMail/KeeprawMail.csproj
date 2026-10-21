@@ -21,11 +21,18 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.Identity.Client" Version="4.79.2" />
     <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.6.250108002" />
+    <!-- WindowsAppSDK 1.6 自带的 WebView2 1.0.2651.64 只有 net6.0 投影程序集，Native AOT 发布时产生 IL2104/IL3053；
+         1.0.4258.31 提供 net8.0 的 AOT 兼容投影。 -->
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.4258.31" />
     <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.26100.1742" />
     <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.0" />
     <PackageReference Include="Microsoft.Data.Sqlite" Version="9.0.0" />
-    <PackageReference Include="MailKit" Version="4.9.0" />
-    <PackageReference Include="MimeKit" Version="4.9.0" />
+    <PackageReference Include="MailKit" Version="4.18.1" />
+    <PackageReference Include="MimeKit" Version="4.18.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\KeeprawMail.Core\KeeprawMail.Core.csproj" />
   </ItemGroup>
 
   <ItemGroup>

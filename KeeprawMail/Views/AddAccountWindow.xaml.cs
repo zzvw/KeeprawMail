@@ -175,7 +175,9 @@ namespace KeeprawMail.Views
                     ImapPort = (int)ImapPortNumberBox.Value,
                     SmtpServer = SmtpServerTextBox.Text.Trim(),
                     SmtpPort = (int)SmtpPortNumberBox.Value,
-                    Password = PasswordBox.Password
+                    AuthType = KeeprawMail.Core.Storage.AccountAuthTypes.Password,
+                    Password = PasswordBox.Password,
+                    ProxyType = KeeprawMail.Core.Networking.AccountProxySettings.StoredInherit,
                 };
 
                 // 保存到数据库
@@ -190,47 +192,87 @@ namespace KeeprawMail.Views
             }
         }
 
+        private System.Threading.CancellationTokenSource? _loginCts;
+
         /// <summary>
-        /// OAuth 登录按钮点击事件
+        /// OAuth 登录按钮点击事件。
+        /// 本窗口没有账号代理选项，新账号继承全局代理（GLOBAL）。
+        /// 浏览器授权使用系统浏览器自己的代理设置；Token 交换与用户信息请求走全局代理。
         /// </summary>
         private async void OAuthLoginButton_Click(object sender, RoutedEventArgs e)
         {
+            if (_loginCts != null) return;
+            _loginCts = new System.Threading.CancellationTokenSource();
+            OAuthLoginButton.IsEnabled = false;
             try
             {
-                var oauthService = new KeeprawMail.Services.OAuthService();
-                // 使用新的返回元组
-                var (accessToken, refreshToken, expiration, email) = await oauthService.LoginGmailAsync();
+                var global = await KeeprawMail.Services.AppServices.GetGlobalProxyAsync();
+                var effectiveProxy = KeeprawMail.Core.Networking.ProxyResolver.Resolve(global, KeeprawMail.Core.Networking.AccountProxySettings.Inherit);
 
-                // 登录成功，自动填充并保存
+                var oauthService = new KeeprawMail.Services.OAuthService();
+                var login = await oauthService.LoginGmailAsync(
+                    effectiveProxy,
+                    loginHint: string.IsNullOrWhiteSpace(EmailTextBox.Text) ? null : EmailTextBox.Text.Trim(),
+                    cancellationToken: _loginCts.Token);
+
+                var existingAccounts = await _dbContext.GetAccountsAsync();
+                var existing = existingAccounts.FirstOrDefault(a => a.Email.Equals(login.Email, StringComparison.OrdinalIgnoreCase));
+                if (existing != null)
+                {
+                    if (existing.Provider != EmailProvider.Gmail)
+                    {
+                        await ShowErrorDialog("该邮箱账号已存在");
+                        return;
+                    }
+
+                    // 已存在的 Gmail 账号：这是一次重新授权。授权返回的邮箱与该账号一致（上面按邮箱匹配），
+                    // 新 Token 写入原 AccountId；账号 ID、代理设置、本地邮件与草稿保持不变。
+                    await KeeprawMail.Services.AppServices.Tokens.SaveAsync(existing.Id, login.Tokens);
+                    if (!existing.IsOAuth)
+                    {
+                        existing.AuthType = KeeprawMail.Core.Storage.AccountAuthTypes.OAuth2;
+                        await _dbContext.SaveAccountAsync(existing);
+                    }
+                    await ShowInfoDialog("已重新授权", "该 Gmail 账号已存在，已用本次授权更新它的登录凭据（账号、代理设置和本地邮件均保留）。");
+                    this.Close();
+                    return;
+                }
+
                 var account = new AccountProfile
                 {
                     Id = Guid.NewGuid().ToString(),
-                    Email = email, // 从 UserInfo 获取的邮箱
+                    Email = login.Email,
                     Provider = EmailProvider.Gmail,
                     ImapServer = "imap.gmail.com",
                     ImapPort = 993,
                     SmtpServer = "smtp.gmail.com",
                     SmtpPort = 587,
-                    Password = "", // OAuth 不需要密码
-                    OAuthToken = accessToken,
-                    RefreshToken = refreshToken, // 现在我们有 Refresh Token 了
-                    TokenExpiration = expiration
+                    AuthType = KeeprawMail.Core.Storage.AccountAuthTypes.OAuth2,
+                    OAuthToken = login.Tokens.AccessToken,
+                    RefreshToken = login.Tokens.RefreshToken,
+                    TokenExpiration = login.Tokens.AccessTokenExpiresAt,
+                    ProxyType = KeeprawMail.Core.Networking.AccountProxySettings.StoredInherit,
                 };
-
-                // 检查是否已存在
-                var existingAccounts = await _dbContext.GetAccountsAsync();
-                if (existingAccounts.Any(a => a.Email.Equals(account.Email, StringComparison.OrdinalIgnoreCase)))
-                {
-                    await ShowErrorDialog("该邮箱账号已存在");
-                    return;
-                }
 
                 await _dbContext.SaveAccountAsync(account);
                 this.Close();
             }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (KeeprawMail.Core.Auth.OAuthUserCancelledException ex)
+            {
+                await ShowErrorDialog(ex.Message);
+            }
             catch (Exception ex)
             {
                 await ShowErrorDialog($"登录失败：{ex.Message}");
+            }
+            finally
+            {
+                _loginCts?.Dispose();
+                _loginCts = null;
+                OAuthLoginButton.IsEnabled = true;
             }
         }
 
@@ -239,6 +281,7 @@ namespace KeeprawMail.Views
         /// </summary>
         private void CancelButton_Click(object sender, RoutedEventArgs e)
         {
+            _loginCts?.Cancel();
             this.Close();
         }
 
@@ -257,6 +300,18 @@ namespace KeeprawMail.Views
                 "Sina" => EmailProvider.Sina,
                 _ => EmailProvider.Custom
             };
+        }
+
+        private async System.Threading.Tasks.Task ShowInfoDialog(string title, string message)
+        {
+            var dialog = new ContentDialog
+            {
+                Title = title,
+                Content = message,
+                CloseButtonText = "确定",
+                XamlRoot = this.Content.XamlRoot
+            };
+            await dialog.ShowAsync();
         }
 
         private async System.Threading.Tasks.Task ShowErrorDialog(string message)

@@ -3,6 +3,8 @@ using Microsoft.UI.Xaml.Controls;
 using Microsoft.Web.WebView2.Core;
 using KeeprawMail.ViewModels;
 using KeeprawMail.Models;
+using KeeprawMail.Core.Reading;
+using KeeprawMail.Core.Sync;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -28,6 +30,23 @@ namespace KeeprawMail.Views
             // 手动同步邮件列表 (绕过 Native AOT ItemsSource 问题)
             SyncEmailList();
             ViewModel.Emails.CollectionChanged += (s, e) => SyncEmailList();
+            ViewModel.SyncFinishedWithProblems += OnSyncFinishedWithProblems;
+            this.Unloaded += (s, e) => ViewModel.SyncFinishedWithProblems -= OnSyncFinishedWithProblems;
+        }
+
+        /// <summary>同步有失败时弹窗列出失败账号、失败阶段与可操作的说明（状态栏只放得下一行）。</summary>
+        private async void OnSyncFinishedWithProblems(object? sender, System.Collections.Generic.IReadOnlyList<AccountSyncReport> reports)
+        {
+            if (this.XamlRoot == null) return;
+            var text = string.Join("\n\n", reports.Where(r => r.Status != AccountSyncStatus.Success).Select(r => r.Describe()));
+            var dialog = new ContentDialog
+            {
+                Title = reports.Any(r => r.Status == AccountSyncStatus.Failed) ? "部分账号同步失败" : "同步部分成功",
+                Content = new ScrollViewer { Content = new TextBlock { Text = text, TextWrapping = TextWrapping.Wrap, IsTextSelectionEnabled = true }, MaxHeight = 400 },
+                CloseButtonText = "知道了",
+                XamlRoot = this.XamlRoot
+            };
+            try { await dialog.ShowAsync(); } catch { /* 已有对话框打开时忽略，状态栏仍显示摘要 */ }
         }
 
         private void SyncEmailList()
@@ -80,178 +99,209 @@ namespace KeeprawMail.Views
         /// </summary>
         private async System.Threading.Tasks.Task CreateEmailTabAsync(EmailMessage email)
         {
-            System.Diagnostics.Debug.WriteLine($"==> CreateEmailTabAsync 开始: {email.Subject}");
-            
             // 限制标签数量
-            if (_openTabs.Count >= MaxTabCount)
+            if (_openTabs.Count >= MaxTabCount && EmailTabView.TabItems.Count > 0)
             {
-                System.Diagnostics.Debug.WriteLine($"==> 达到最大标签数 ({MaxTabCount})，关闭最旧标签");
-                // 关闭最旧的标签页（第一个）
-                if (EmailTabView.TabItems.Count > 0)
-                {
-                    var oldestTab = EmailTabView.TabItems[0] as TabViewItem;
-                    if (oldestTab != null && oldestTab.Tag is string oldEmailId)
-                    {
-                        _openTabs.Remove(oldEmailId);
-                        EmailTabView.TabItems.RemoveAt(0);
-                    }
-                }
+                if (EmailTabView.TabItems[0] is TabViewItem oldestTab)
+                    CloseTab(oldestTab);
             }
 
-            System.Diagnostics.Debug.WriteLine($"==> 创建 WebView2 控件");
-            // 创建 WebView2
+            // 标签页内容容器：正常时放 WebView2，出错时放错误提示和“重试”按钮
+            var host = new Grid
+            {
+                HorizontalAlignment = HorizontalAlignment.Stretch,
+                VerticalAlignment = VerticalAlignment.Stretch
+            };
+
+            var tabItem = new TabViewItem
+            {
+                Header = TruncateString(email.Subject, 30),
+                Content = host,
+                Tag = email.Id, // 邮件 ID（只用于查找标签页，绝不用作文件名）
+                IconSource = new SymbolIconSource { Symbol = Symbol.Mail }
+            };
+
+            // 先添加到 TabView（这样 WebView2 才在可视化树中）
+            EmailTabView.TabItems.Add(tabItem);
+            EmailTabView.SelectedItem = tabItem;
+            _openTabs[email.Id] = tabItem;
+
+            PlaceholderText.Visibility = Visibility.Collapsed;
+            EmailTabView.Visibility = Visibility.Visible;
+
+            await LoadEmailIntoTabAsync(email, tabItem, host);
+        }
+
+        /// <summary>
+        /// 在标签页中加载邮件：初始化 WebView2（关闭脚本、拦截导航）→ 读取本地正文 → 生成阅读页面 → 导航。
+        /// 任何一步失败都会在标签页里显示阶段和原因，并提供“重试”。
+        /// </summary>
+        private async System.Threading.Tasks.Task LoadEmailIntoTabAsync(EmailMessage email, TabViewItem tabItem, Grid host)
+        {
+            CloseWebViews(host);
+            host.Children.Clear();
+
             var webView = new WebView2
             {
                 HorizontalAlignment = HorizontalAlignment.Stretch,
                 VerticalAlignment = VerticalAlignment.Stretch
             };
-
-            // 订阅导航事件以进行调试
-            webView.NavigationStarting += (s, e) => 
-            {
-                System.Diagnostics.Debug.WriteLine($"==> WebView2 NavigationStarting: {e.Uri}");
-            };
-            webView.NavigationCompleted += (s, e) => 
-            {
-                System.Diagnostics.Debug.WriteLine($"==> WebView2 NavigationCompleted: Success={e.IsSuccess}, WebErrorStatus={e.WebErrorStatus}");
-            };
-            // 修正：WinUI 3 中使用 CoreWebView2Initialized 事件
-            webView.CoreWebView2Initialized += (s, e) =>
-            {
-                System.Diagnostics.Debug.WriteLine($"==> WebView2 Initialized: Exception={e.Exception?.Message ?? "None"}");
-            };
-
-            // 创建标签页内容容器
-            var tabContent = new Grid
-            {
-                HorizontalAlignment = HorizontalAlignment.Stretch,
-                VerticalAlignment = VerticalAlignment.Stretch
-            };
-            tabContent.Children.Add(webView);
-
-            // 创建标签页
-            var tabItem = new TabViewItem
-            {
-                Header = TruncateString(email.Subject, 30),
-                Content = tabContent,
-                Tag = email.Id, // 存储邮件 ID
-                IconSource = new SymbolIconSource { Symbol = Symbol.Mail }
-            };
-
-            System.Diagnostics.Debug.WriteLine($"==> 添加标签页到 TabView");
-            // 先添加到 TabView（这样 WebView2 才在可视化树中）
-            EmailTabView.TabItems.Add(tabItem);
-            EmailTabView.SelectedItem = tabItem;
-
-            // 缓存
-            _openTabs[email.Id] = tabItem;
-
-            // 显示 TabView，隐藏占位符
-            PlaceholderText.Visibility = Visibility.Collapsed;
-            EmailTabView.Visibility = Visibility.Visible;
-            System.Diagnostics.Debug.WriteLine($"==> TabView 可见性已更新, 标签页数: {EmailTabView.TabItems.Count}");
-
-            // 强制布局更新以确保 WebView2 有尺寸
+            host.Children.Add(webView);
             EmailTabView.UpdateLayout();
-            System.Diagnostics.Debug.WriteLine($"==> WebView2 尺寸: {webView.ActualWidth} x {webView.ActualHeight}");
 
-            // 现在 WebView2 已经在可视化树中，可以初始化并加载内容
+            var stage = "WebView2 初始化";
             try
             {
-                System.Diagnostics.Debug.WriteLine($"==> 开始初始化 WebView2");
-                
-                // 修正：直接调用 EnsureCoreWebView2Async，环境已通过环境变量配置 (在 MainWindow 构造函数中)
-                // 注意：MailPage 是在 MainWindow 中导航的，所以环境变量应该已经设置好了
                 await webView.EnsureCoreWebView2Async();
-                
-                System.Diagnostics.Debug.WriteLine($"==> WebView2 初始化成功，准备加载内容");
+                var core = webView.CoreWebView2;
 
-                // 加载邮件内容
-                string bodyContent = string.Empty;
-                if (!string.IsNullOrEmpty(email.BodyLocalPath) && System.IO.File.Exists(email.BodyLocalPath))
+                // 外来邮件 HTML 不可信：关闭脚本与一切宿主交互
+                var settings = core.Settings;
+                settings.IsScriptEnabled = false;
+                settings.AreDefaultScriptDialogsEnabled = false;
+                settings.IsWebMessageEnabled = false;
+                settings.AreHostObjectsAllowed = false;
+                settings.AreDevToolsEnabled = false;
+                settings.IsStatusBarEnabled = false;
+                settings.IsPasswordAutosaveEnabled = false;
+                settings.IsGeneralAutofillEnabled = false;
+
+                stage = "读取本地正文";
+                var load = await ReaderDocument.LoadBodyAsync(email.BodyLocalPath, Data.AppPaths.BodyCache);
+                var html = load.Success
+                    ? ReaderDocument.Build(email.Subject, email.SenderName, email.SenderAddress, email.FullDateTooltip, load.Content)
+                    : ReaderDocument.BuildError(email.Subject, "无法显示邮件正文", load.Error ?? "未知错误");
+                if (!load.Success)
+                    DiagnosticLog.Write("reader", $"body unavailable: {load.Error}");
+
+                stage = "写入阅读页面";
+                var cache = Data.AppPaths.ReaderCache;
+                // 文件名 = SHA-256(邮件 ID)；邮件 ID 含 | : / 等 Windows 禁用字符，不能直接用作文件名
+                var pagePath = await cache.WriteTextAsync(cache.GetFlatPath(email.Id), html);
+                var pageUri = new Uri(pagePath);
+
+                ulong? pageNavigationId = null;
+                core.NavigationStarting += (s, e) =>
                 {
-                    System.Diagnostics.Debug.WriteLine($"==> 从文件读取正文: {email.BodyLocalPath}");
-                    try
+                    if (IsSameDocument(e.Uri, pageUri))
                     {
-                        bodyContent = await System.IO.File.ReadAllTextAsync(email.BodyLocalPath);
+                        pageNavigationId ??= e.NavigationId;
+                        return;
                     }
-                    catch (Exception ex)
-                    {
-                        System.Diagnostics.Debug.WriteLine($"==> 读取正文失败: {ex.Message}");
-                        bodyContent = $"<p>无法加载邮件内容: {ex.Message}</p><hr/><p>{email.Snippet}</p>";
-                    }
-                }
-                else
+                    // 邮件里的链接一律不在阅读器中打开；http/https/mailto 交给系统浏览器 / 邮件程序
+                    e.Cancel = true;
+                    OpenExternally(e.Uri);
+                };
+                core.FrameNavigationStarting += (s, e) => e.Cancel = true;
+                core.NewWindowRequested += (s, e) =>
                 {
-                    bodyContent = $"<p>{email.Snippet}</p><p><i>(正文文件未找到)</i></p>";
-                }
-
-                if (!string.IsNullOrEmpty(bodyContent))
+                    e.Handled = true;
+                    OpenExternally(e.Uri);
+                };
+                core.DownloadStarting += (s, e) => e.Cancel = true;
+                core.PermissionRequested += (s, e) => e.State = CoreWebView2PermissionState.Deny;
+                core.NavigationCompleted += (s, e) =>
                 {
-                    bodyContent = System.Text.RegularExpressions.Regex.Replace(bodyContent, "<meta[^>]*charset[^>]*>", "", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-                    bodyContent = System.Text.RegularExpressions.Regex.Replace(bodyContent, @"</?(html|head|body)[^>]*>", "", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-                }
+                    if (e.NavigationId != pageNavigationId || e.IsSuccess)
+                        return;
+                    DiagnosticLog.Write("reader", $"navigation failed: {e.WebErrorStatus}");
+                    ShowTabError(email, tabItem, host, "加载阅读页面", $"WebView2 导航失败：{e.WebErrorStatus}");
+                };
 
-                var htmlContent = $@"
-                <!DOCTYPE html>
-                <html>
-                <head>
-                    <meta charset='utf-8' />
-                    <meta name='viewport' content='width=device-width, initial-scale=1.0' />
-                    <style>
-                        body {{ font-family: 'Segoe UI', sans-serif; padding: 20px; color: #333; overflow-wrap: break-word; }}
-                        h2 {{ margin-bottom: 5px; }}
-                        .header {{ color: #666; font-size: 14px; margin-bottom: 20px; border-bottom: 1px solid #eee; padding-bottom: 10px; }}
-                        img {{ max-width: 100%; height: auto; }}
-                        table {{ max-width: 100%; }}
-                    </style>
-                </head>
-                <body>
-                    <h2>{email.Subject}</h2>
-                    <div class='header'>
-                        <p><b>From:</b> {email.SenderName} &lt;{email.SenderAddress}&gt;</p>
-                        <p><b>Date:</b> {email.FullDateTooltip}</p>
-                    </div>
-                    <div class='email-content'>
-                        {bodyContent}
-                    </div>
-                </body>
-                </html>";
-
-                // 将 HTML 写入临时文件
-                var tempFile = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"keepraw_email_{email.Id}.html");
-                await System.IO.File.WriteAllTextAsync(tempFile, htmlContent);
-                
-                // 使用 Source 属性导航到文件
-                webView.Source = new Uri(tempFile);
+                stage = "导航到阅读页面";
+                core.Navigate(pageUri.AbsoluteUri);
             }
             catch (Exception ex)
             {
-                System.Diagnostics.Debug.WriteLine($"==> WebView2 加载失败: {ex.Message}");
-                // 即使失败，标签页也已创建，只是内容为空
+                DiagnosticLog.Write("reader", $"[{stage}] {ex.GetType().Name}: {ex.Message}");
+                ShowTabError(email, tabItem, host, stage, ex.Message);
             }
         }
 
+        /// <summary>在标签页内显示错误（阶段 + 原因）和“重试”按钮。</summary>
+        private void ShowTabError(EmailMessage email, TabViewItem tabItem, Grid host, string stage, string message)
+        {
+            CloseWebViews(host);
+            host.Children.Clear();
+
+            var retry = new Button { Content = "重试", Margin = new Thickness(0, 12, 0, 0) };
+            retry.Click += async (s, e) => await LoadEmailIntoTabAsync(email, tabItem, host);
+
+            var panel = new StackPanel { Margin = new Thickness(24), Spacing = 6 };
+            panel.Children.Add(new TextBlock { Text = "无法显示邮件正文", FontSize = 18, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold });
+            panel.Children.Add(new TextBlock { Text = $"失败阶段：{stage}", TextWrapping = TextWrapping.Wrap });
+            panel.Children.Add(new TextBlock { Text = message, TextWrapping = TextWrapping.Wrap, IsTextSelectionEnabled = true });
+            panel.Children.Add(new TextBlock { Text = "可以点击“重试”，或关闭此标签页后重新打开邮件。", TextWrapping = TextWrapping.Wrap, Opacity = 0.7 });
+            panel.Children.Add(retry);
+            host.Children.Add(panel);
+        }
+
+        private static bool IsSameDocument(string? uri, Uri page)
+        {
+            if (string.IsNullOrEmpty(uri) || !Uri.TryCreate(uri, UriKind.Absolute, out var u))
+                return false;
+            return Uri.Compare(u, page, UriComponents.SchemeAndServer | UriComponents.Path, UriFormat.Unescaped, StringComparison.OrdinalIgnoreCase) == 0;
+        }
+
+        private static void OpenExternally(string? uri)
+        {
+            if (string.IsNullOrEmpty(uri) || !Uri.TryCreate(uri, UriKind.Absolute, out var u))
+                return;
+            if (u.Scheme is "http" or "https" or "mailto")
+                _ = Windows.System.Launcher.LaunchUriAsync(u);
+        }
+
+        private static void CloseWebViews(Grid host)
+        {
+            foreach (var child in host.Children)
+            {
+                if (child is WebView2 wv)
+                {
+                    try { wv.Close(); } catch { }
+                }
+            }
+        }
+
+        private void CloseTab(TabViewItem tabItem)
+        {
+            if (tabItem.Tag is string id)
+                _openTabs.Remove(id);
+            EmailTabView.TabItems.Remove(tabItem);
+            if (tabItem.Content is Grid grid)
+                CloseWebViews(grid);
+        }
+
         /// <summary>
-        /// 标签页关闭事件
+        /// 启动时清理阅读器页面缓存，以及旧版本写在系统临时目录里的 keepraw_email_*.html（含邮件内容）。
+        /// 只删除应用缓存目录内的文件和该固定前缀的临时文件。
+        /// </summary>
+        public static void CleanupReaderCache()
+        {
+            var cache = Data.AppPaths.ReaderCache;
+            if (System.IO.Directory.Exists(cache.Root))
+            {
+                foreach (var f in System.IO.Directory.GetFiles(cache.Root, "*.html"))
+                    cache.TryDeleteFile(f, out _);
+            }
+            try
+            {
+                foreach (var f in System.IO.Directory.GetFiles(System.IO.Path.GetTempPath(), "keepraw_email_*.html"))
+                {
+                    try { System.IO.File.Delete(f); } catch { }
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 标签页关闭事件：关闭后可重新打开同一封邮件重试。
         /// </summary>
         private void EmailTabView_TabCloseRequested(TabView sender, TabViewTabCloseRequestedEventArgs args)
         {
-            if (args.Tab is TabViewItem tabItem && tabItem.Tag is string emailId)
+            if (args.Tab is TabViewItem tabItem)
             {
-                // 从缓存移除
-                _openTabs.Remove(emailId);
+                CloseTab(tabItem);
 
-                // 从 TabView 移除
-                sender.TabItems.Remove(tabItem);
-
-                // 释放 WebView2资源
-                if (tabItem.Content is Grid grid && grid.Children.Count > 0 && grid.Children[0] is WebView2 webView)
-                {
-                    webView.Close();
-                }
-
-                // 如果没有标签页了，显示占位符
                 if (sender.TabItems.Count == 0)
                 {
                     EmailTabView.Visibility = Visibility.Collapsed;
@@ -516,19 +566,20 @@ namespace KeeprawMail.Views
                             // 等待一小段时间确保 JavaScript 完全加载
                             await System.Threading.Tasks.Task.Delay(500);
 
-                            var initData = new
+                            // Native AOT 下禁用了基于反射的 JSON 序列化（匿名类型会在运行时抛异常），改用 JsonObject
+                            var initData = new System.Text.Json.Nodes.JsonObject
                             {
-                                type = "init",
-                                data = new
+                                ["type"] = "init",
+                                ["data"] = new System.Text.Json.Nodes.JsonObject
                                 {
-                                    draftId = draftId,
-                                    to = to ?? "",
-                                    subject = subject ?? "",
-                                    body = body ?? ""
+                                    ["draftId"] = draftId,
+                                    ["to"] = to ?? "",
+                                    ["subject"] = subject ?? "",
+                                    ["body"] = body ?? ""
                                 }
                             };
 
-                            var json = System.Text.Json.JsonSerializer.Serialize(initData);
+                            var json = initData.ToJsonString();
                             webView.CoreWebView2.PostWebMessageAsJson(json);
                             System.Diagnostics.Debug.WriteLine($"[MailPage] 初始化数据已发送: {json}");
                         }
@@ -771,17 +822,18 @@ namespace KeeprawMail.Views
         /// </summary>
         private async System.Threading.Tasks.Task SendResultToWebView(WebView2 webView, bool success, string error)
         {
-            var resultData = new
+            // Native AOT 安全：不使用反射序列化匿名类型
+            var resultData = new System.Text.Json.Nodes.JsonObject
             {
-                type = "sendResult",
-                data = new
+                ["type"] = "sendResult",
+                ["data"] = new System.Text.Json.Nodes.JsonObject
                 {
-                    success,
-                    error
+                    ["success"] = success,
+                    ["error"] = error
                 }
             };
 
-            var json = System.Text.Json.JsonSerializer.Serialize(resultData);
+            var json = resultData.ToJsonString();
             webView.CoreWebView2.PostWebMessageAsJson(json);
         }
     }

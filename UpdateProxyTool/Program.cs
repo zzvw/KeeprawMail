@@ -2,70 +2,72 @@ using Microsoft.Data.Sqlite;
 
 namespace UpdateProxy;
 
+/// <summary>
+/// 开发调试工具：修改本地数据库中某个账号的代理设置。
+///
+/// 用法：
+///   UpdateProxyTool &lt;email&gt; &lt;GLOBAL|NONE|HTTP|SOCKS5&gt; [host] [port]
+///
+/// 不包含任何硬编码的邮箱地址或凭据；只修改代理列，不读取、不输出密码或 Token。
+/// </summary>
 class Program
 {
-    static void Main()
+    private static readonly string[] AllowedTypes = ["GLOBAL", "NONE", "HTTP", "SOCKS5"];
+
+    static int Main(string[] args)
     {
-        // 修改 Gmail 账号的代理类型从 SOCKS5 改为 HTTP
+        if (args.Length < 2)
+        {
+            Console.WriteLine("用法: UpdateProxyTool <email> <GLOBAL|NONE|HTTP|SOCKS5> [host] [port]");
+            return 1;
+        }
+
+        var email = args[0].Trim();
+        var type = args[1].Trim().ToUpperInvariant();
+        var host = args.Length > 2 ? args[2].Trim() : string.Empty;
+        var port = args.Length > 3 && int.TryParse(args[3], out var p) ? p : 0;
+
+        if (Array.IndexOf(AllowedTypes, type) < 0)
+        {
+            Console.WriteLine($"不支持的代理类型: {type}（仅支持 GLOBAL / NONE / HTTP / SOCKS5）");
+            return 1;
+        }
+
+        if ((type == "HTTP" || type == "SOCKS5") && (host.Length == 0 || port is < 1 or > 65535))
+        {
+            Console.WriteLine("HTTP / SOCKS5 需要合法的 host 和 port (1-65535)");
+            return 1;
+        }
+
+        if (type is "GLOBAL" or "NONE")
+        {
+            host = string.Empty;
+            port = 0;
+        }
+
         var dbPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "KeeprawMail",
-            "keepraw.db"
-        );
-
-        Console.WriteLine($"数据库路径: {dbPath}");
+            "keepraw.db");
 
         if (!File.Exists(dbPath))
         {
-            Console.WriteLine("错误：数据库文件不存在！");
-            return;
+            Console.WriteLine($"数据库文件不存在: {dbPath}");
+            return 1;
         }
 
         using var connection = new SqliteConnection($"Data Source={dbPath}");
         connection.Open();
 
-        // 1. 查看当前配置
-        Console.WriteLine("\n=== 修改前的配置 ===");
-        using (var cmd = connection.CreateCommand())
-        {
-            cmd.CommandText = "SELECT Email, ProxyType, ProxyHost, ProxyPort FROM Accounts WHERE Email='forgottenpedestrian@gmail.com'";
-            using var reader = cmd.ExecuteReader();
-            while (reader.Read())
-            {
-                Console.WriteLine($"Email: {reader.GetString(0)}");
-                Console.WriteLine($"ProxyType: {reader.GetString(1)}");
-                Console.WriteLine($"ProxyHost: {reader.GetString(2)}");
-                Console.WriteLine($"ProxyPort: {reader.GetInt32(3)}");
-            }
-        }
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "UPDATE Accounts SET ProxyType = $t, ProxyHost = $h, ProxyPort = $p WHERE Email = $e COLLATE NOCASE";
+        cmd.Parameters.AddWithValue("$t", type);
+        cmd.Parameters.AddWithValue("$h", host);
+        cmd.Parameters.AddWithValue("$p", port);
+        cmd.Parameters.AddWithValue("$e", email);
+        var rows = cmd.ExecuteNonQuery();
 
-        // 2. 修改为 SOCKS4A + 端口 1080（实验性：SOCKS4A 可能有更好的兼容性）
-        Console.WriteLine("\n=== 正在修改为 SOCKS4A 代理，端口 1080 ===");
-        using (var cmd = connection.CreateCommand())
-        {
-            cmd.CommandText = "UPDATE Accounts SET ProxyType='SOCKS4A', ProxyPort=1080 WHERE Email='forgottenpedestrian@gmail.com'";
-            var rowsAffected = cmd.ExecuteNonQuery();
-            Console.WriteLine($"已修改 {rowsAffected} 条记录");
-        }
-
-        // 3. 验证修改结果
-        Console.WriteLine("\n=== 修改后的配置 ===");
-        using (var cmd = connection.CreateCommand())
-        {
-            cmd.CommandText = "SELECT Email, ProxyType, ProxyHost, ProxyPort FROM Accounts WHERE Email='forgottenpedestrian@gmail.com'";
-            using var reader = cmd.ExecuteReader();
-            while (reader.Read())
-            {
-                Console.WriteLine($"Email: {reader.GetString(0)}");
-                Console.WriteLine($"ProxyType: {reader.GetString(1)}");
-                Console.WriteLine($"ProxyHost: {reader.GetString(2)}");
-                Console.WriteLine($"ProxyPort: {reader.GetInt32(3)}");
-            }
-        }
-
-        Console.WriteLine("\n✅ 修改完成！");
-        Console.WriteLine("说明：已切换到 SOCKS4A 协议，端口 1080");
-        Console.WriteLine("SOCKS4A 是 SOCKS4 的扩展，支持域名解析，可能与 v2rayN 有更好的兼容性。");
-        Console.ReadKey();
+        Console.WriteLine(rows > 0 ? $"已更新 {rows} 个账号的代理设置为 {type}" : "未找到该邮箱对应的账号");
+        return rows > 0 ? 0 : 2;
     }
 }

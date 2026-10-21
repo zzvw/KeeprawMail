@@ -68,12 +68,42 @@ $env:KEEPRAWMAIL_GOOGLE_CLIENT_SECRET = "你的客户端密钥"
 
 环境变量优先级高于凭据文件，适合 CI / 打包流水线。
 
-### 客户端密钥可以留空
+### 关于客户端密钥
 
-桌面应用（Desktop app）类型的客户端通常不需要 client secret，此时省略 `clientSecret`
-字段即可，程序会自动跳过该参数。
+Google 为“桌面应用”类型签发的 client secret 并不是真正的机密（任何分发出去的桌面程序都能被提取），
+本应用已使用 PKCE(S256) 防止授权码被截获后冒用。但 Google 的 token 端点对 Desktop 客户端
+**通常仍要求**携带 `client_secret`，因此建议照常填写；若留空，程序不会发送该参数。
 
 配置完成后，重新编译并运行 Keepraw Mail，即可使用 "Sign in with Google" 登录。
+
+## 授权要求与“此应用已被阻止”
+
+`https://mail.google.com/`（IMAP/SMTP 完整访问）是 Google 定义的 **受限（restricted）范围**。
+这意味着：
+
+| 应用发布状态 | 谁能登录 | Refresh Token 有效期 | 需要做什么 |
+|---|---|---|---|
+| **测试（Testing）** | 只有 OAuth 同意屏幕中登记的**测试用户**（最多 100 个） | **7 天**后失效，需要重新登录 | 在“测试用户”中添加自己的邮箱 |
+| **正式（In production）· 仅个人使用** | 任何人，但会看到“Google 尚未验证此应用”警告，且用户数有上限 | 正常 | 自用可点击“高级 → 继续” |
+| **正式 · 面向公众分发** | 任何人 | 正常 | 必须通过 Google 的应用验证（品牌、隐私政策、域名所有权）以及受限范围所需的**第三方安全评估（CASA）** |
+
+几点必须明确：
+
+* 看到 **“此应用已被阻止 / This app is blocked”** 或 `access_denied`、`admin_policy_enforced`，
+  原因在 Google 侧的授权策略（未登记为测试用户、应用未验证、Workspace 管理员禁止了第三方应用等），
+  **无法通过修改代码绕过**，只能按上表调整 Google Cloud 项目配置或联系 Workspace 管理员。
+* 本项目**不内置、也不会使用**其他开源项目或其他应用的 OAuth Client ID，更不会冒充其他应用
+  （例如 Thunderbird）。每位用户/分发者都应使用自己创建的 Client ID。
+* Refresh Token 失效（测试模式 7 天到期、用户撤销授权、修改密码等）时，应用会提示“授权已失效，请删除后重新登录”。
+
+## 登录浏览器与代理
+
+登录时打开的是**系统默认浏览器**。浏览器是独立进程，访问 `accounts.google.com` 时使用的是
+**浏览器自己的 / 系统的代理设置**，Keepraw Mail 的代理配置**无法控制外部浏览器**。
+如果你的网络需要代理才能访问 Google，请确保浏览器本身可以打开 Google 登录页。
+
+授权完成后浏览器会跳转到 `http://127.0.0.1:<随机端口>/`，这是本机回环地址，不经过任何代理。
+之后的 **Token 交换、Token 刷新、用户信息请求、IMAP、SMTP** 全部走账号的生效代理（见 [代理配置](ProxyConfiguration.md)）。
 
 > **安全提示**：Client ID / Client Secret 一旦出现在提交记录中就应视为已泄露。
 > 如果你之前把它们提交到了公开仓库，请立刻在
