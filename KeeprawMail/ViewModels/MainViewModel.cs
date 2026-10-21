@@ -184,96 +184,75 @@ namespace KeeprawMail.ViewModels
                 SyncFinishedWithProblems?.Invoke(this, reports);
         }
 
+        // ---- 增量同步与按需正文（实现见 KeeprawMail.Core：MailboxSyncEngine / AccountSyncService / OnDemandBodyLoader）----
+
+        private Core.Sync.AccountSyncService? _syncService;
+        private Core.Reading.OnDemandBodyLoader? _bodyLoader;
+
+        /// <summary>同一个服务实例在整个应用内按账号串行化同步（不同账号仍并发）。</summary>
+        private Core.Sync.AccountSyncService SyncService => _syncService ??= new Core.Sync.AccountSyncService(
+            new Core.Sync.MailboxSyncEngine(
+                _databaseContext.CreateEmailStore(),
+                _databaseContext.CreateSyncStateStore(),
+                Data.AppPaths.BodyCache,
+                log: line => DiagnosticLog.Write("sync", line)),
+            line => DiagnosticLog.Write("sync", line));
+
+        private Core.Reading.OnDemandBodyLoader BodyLoader => _bodyLoader ??= new Core.Reading.OnDemandBodyLoader(
+            _databaseContext.CreateEmailStore(),
+            Data.AppPaths.BodyCache,
+            async (accountId, ct) =>
+            {
+                // 按邮件所属账号连接（不是当前选中的账号），走该账号自己的代理与 TokenManager
+                var account = (await _databaseContext.GetAccountsAsync()).FirstOrDefault(a => a.Id == accountId)
+                    ?? throw new MailSyncException(SyncStage.ResolveProxy, "找不到这封邮件所属的账号（可能已被删除）。");
+                return await Services.ImapService.OpenSessionAsync(account, ct);
+            },
+            line => DiagnosticLog.Write("reader", line));
+
         /// <summary>
-        /// 同步单个账号：连接 → 认证 → 列举文件夹 → 逐个文件夹下载邮件头和正文 → 保存数据库。
-        /// 每一步失败都带上阶段；所有文件夹都失败时报告为失败，不会报“同步成功”。
+        /// 同步单个账号：连接 → 认证 → 列举文件夹 → 每个文件夹按 UIDVALIDITY + UID 游标增量同步元数据与 Flags。
+        /// 普通同步不下载任何正文或附件。每一步失败都带上阶段；所有文件夹都失败时报告为失败，不会报“同步成功”。
+        /// 同一账号同时只有一个同步在运行，重复触发会合并到正在进行的同步。
         /// </summary>
-        private async Task<AccountSyncReport> SyncAccountAsync(Models.AccountProfile account)
+        private Task<AccountSyncReport> SyncAccountAsync(Models.AccountProfile account)
         {
-            var report = new AccountSyncReport(account.Id, account.Email);
-            DiagnosticLog.Write("sync", $"start {account.Email}");
-            try
+            // Progress<T> 在 UI 线程上创建，回调回到 UI 线程更新状态栏
+            var progress = new System.Progress<MailboxSyncProgress>(p =>
             {
-                using var imapService = new Services.ImapService();
-
-                // 连接 + TLS + 认证（内部已按阶段分类异常）
-                await imapService.ConnectAsync(account);
-
-                System.Collections.Generic.List<string> foldersToSync;
-                try
+                StatusMessage = p.Phase switch
                 {
-                    foldersToSync = await imapService.GetFoldersToSyncAsync();
-                }
-                catch (MailSyncException) { throw; }
-                catch (System.Exception ex)
-                {
-                    throw new MailSyncException(SyncStage.ListFolders, $"列举 {account.Email} 的文件夹失败：{ex.Message}", ex);
-                }
+                    MailboxSyncPhase.Baseline => $"正在同步 {account.Email} / {p.Mailbox}：首次同步邮件头 {p.Processed}/{p.Total}",
+                    MailboxSyncPhase.NewMessages => $"正在同步 {account.Email} / {p.Mailbox}：新邮件 {p.Processed}/{p.Total}",
+                    MailboxSyncPhase.Flags => $"正在同步 {account.Email} / {p.Mailbox}：检查已读 / 星标变化",
+                    MailboxSyncPhase.Reconcile => $"正在同步 {account.Email} / {p.Mailbox}：核对服务器已删除的邮件",
+                    _ => $"正在同步 {account.Email} / {p.Mailbox}...",
+                };
+            });
+            return SyncService.SyncAsync(account.Id, account.Email,
+                ct => Services.ImapService.ConnectForSyncAsync(account, ct), progress);
+        }
 
-                var newEmails = new System.Collections.Generic.List<EmailMessage>();
-                var bodyCache = Data.AppPaths.BodyCache;
-
-                await FolderSyncRunner.RunAsync(report, foldersToSync, async folderName =>
-                {
-                    System.Collections.Generic.List<EmailMessage> folderEmails;
-                    try
-                    {
-                        folderEmails = await imapService.SyncHeadersAsync(folderName);
-                    }
-                    catch (System.Exception ex) when (ex is not MailSyncException)
-                    {
-                        throw new MailSyncException(SyncStage.FetchHeaders, ex.Message, ex);
-                    }
-
-                    foreach (var email in folderEmails)
-                    {
-                        email.AccountId = account.Id;
-                        try
-                        {
-                            var body = await imapService.GetBodyAsync(email.Mailbox, email.Id);
-                            // 缓存文件名由 SHA-256 生成，与含 | : / 的邮件 ID 分离
-                            var filePath = await bodyCache.WriteTextAsync(bodyCache.GetBodyPath(account.Id, email.Id), body);
-                            email.BodyLocalPath = filePath;
-
-                            var snippet = System.Text.RegularExpressions.Regex.Replace(body, "<.*?>", string.Empty);
-                            email.Snippet = snippet.Length > 200 ? snippet.Substring(0, 200) : snippet;
-                        }
-                        catch (System.Exception bodyEx)
-                        {
-                            report.BodyFailures++;
-                            DiagnosticLog.Write("sync", $"[{SyncStageNames.Display(SyncStage.FetchBody)}] {account.Email}/{email.Mailbox}: {bodyEx.GetType().Name}: {bodyEx.Message}");
-                            email.BodyLocalPath = "";
-                            email.Snippet = "正文下载失败";
-                        }
-                    }
-
-                    newEmails.AddRange(folderEmails);
-                    return folderEmails.Count;
-                }, line => DiagnosticLog.Write("sync", line));
-
-                if (newEmails.Count > 0)
-                {
-                    try
-                    {
-                        await _databaseContext.SaveEmailsAsync(newEmails);
-                    }
-                    catch (System.Exception ex)
-                    {
-                        throw new MailSyncException(SyncStage.SaveDatabase, $"保存邮件到本地数据库失败：{ex.Message}", ex);
-                    }
-                }
-            }
-            catch (MailSyncException ex)
+        /// <summary>
+        /// 打开邮件前确保正文可用：缓存可用时直接返回（不联网）；否则按邮件所属账号按需下载正文 MIME 部分（不含附件），
+        /// 写入正文缓存，只更新数据库中的正文路径与摘要，并更新当前列表项。同一封邮件的并发请求只下载一次。
+        /// </summary>
+        public async Task<Core.Reading.BodyEnsureResult> EnsureBodyAvailableAsync(EmailMessage email, System.Threading.CancellationToken cancellationToken)
+        {
+            var result = await BodyLoader.EnsureBodyAvailableAsync(
+                new Core.Reading.BodyRequest(email.Id, email.AccountId, email.Mailbox, email.ImapUid, email.BodyLocalPath),
+                cancellationToken);
+            if (result.Success)
             {
-                report.Fatal = ex;
+                email.BodyLocalPath = result.BodyLocalPath;
+                if (!string.IsNullOrEmpty(result.Snippet) && (!result.FromCache || string.IsNullOrEmpty(email.Snippet)))
+                    email.Snippet = result.Snippet;
             }
-            catch (System.Exception ex)
+            else
             {
-                report.Fatal = new MailSyncException(SyncStage.TcpConnect, ex.Message, ex);
+                DiagnosticLog.Write("reader", $"[{SyncStageNames.Display(result.FailedStage ?? SyncStage.FetchBody)}] body unavailable: {result.Error}");
             }
-
-            DiagnosticLog.Write("sync", report.Describe());
-            return report;
+            return result;
         }
 
         /// <summary>

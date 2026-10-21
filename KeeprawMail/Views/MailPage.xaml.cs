@@ -17,6 +17,9 @@ namespace KeeprawMail.Views
 
         // 缓存已打开的标签页 (Key = Email ID)
         private Dictionary<string, TabViewItem> _openTabs = new Dictionary<string, TabViewItem>();
+
+        // 每个标签页当前的加载任务（关闭标签页时取消不再需要的正文下载）
+        private readonly Dictionary<TabViewItem, System.Threading.CancellationTokenSource> _tabLoads = new();
         private const int MaxTabCount = 10;
         private static readonly string DraftRootPath = System.IO.Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -141,6 +144,41 @@ namespace KeeprawMail.Views
             CloseWebViews(host);
             host.Children.Clear();
 
+            // 取消该标签页上一次尚未完成的加载（例如连续点击“重试”）
+            if (_tabLoads.Remove(tabItem, out var previous))
+            {
+                previous.Cancel();
+                previous.Dispose();
+            }
+            var cts = new System.Threading.CancellationTokenSource();
+            _tabLoads[tabItem] = cts;
+
+            // 1. 确保正文可用：缓存可用时不联网；缺失时按邮件所属账号按需下载正文（不下载附件）
+            host.Children.Add(BuildLoadingPanel());
+            Core.Reading.BodyEnsureResult ensure;
+            try
+            {
+                ensure = await ViewModel.EnsureBodyAvailableAsync(email, cts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                return; // 标签页已关闭或已重新加载
+            }
+            catch (Exception ex)
+            {
+                if (cts.IsCancellationRequested) return;
+                ensure = Core.Reading.BodyEnsureResult.Fail(SyncStage.FetchBody, ex.Message);
+            }
+            if (cts.IsCancellationRequested || !_tabLoads.TryGetValue(tabItem, out var current) || !ReferenceEquals(current, cts))
+                return;
+            host.Children.Clear();
+            if (!ensure.Success)
+            {
+                // “重试”会再次调用本方法：缓存仍缺失，因此会真正重新下载正文
+                ShowTabError(email, tabItem, host, SyncStageNames.Display(ensure.FailedStage ?? SyncStage.FetchBody), ensure.Error ?? "未知错误");
+                return;
+            }
+
             var webView = new WebView2
             {
                 HorizontalAlignment = HorizontalAlignment.Stretch,
@@ -218,6 +256,14 @@ namespace KeeprawMail.Views
             }
         }
 
+        private static StackPanel BuildLoadingPanel()
+        {
+            var panel = new StackPanel { Margin = new Thickness(24), Spacing = 8, HorizontalAlignment = HorizontalAlignment.Left };
+            panel.Children.Add(new ProgressRing { IsActive = true, Width = 24, Height = 24, HorizontalAlignment = HorizontalAlignment.Left });
+            panel.Children.Add(new TextBlock { Text = "正在加载正文…", Opacity = 0.7 });
+            return panel;
+        }
+
         /// <summary>在标签页内显示错误（阶段 + 原因）和“重试”按钮。</summary>
         private void ShowTabError(EmailMessage email, TabViewItem tabItem, Grid host, string stage, string message)
         {
@@ -231,7 +277,7 @@ namespace KeeprawMail.Views
             panel.Children.Add(new TextBlock { Text = "无法显示邮件正文", FontSize = 18, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold });
             panel.Children.Add(new TextBlock { Text = $"失败阶段：{stage}", TextWrapping = TextWrapping.Wrap });
             panel.Children.Add(new TextBlock { Text = message, TextWrapping = TextWrapping.Wrap, IsTextSelectionEnabled = true });
-            panel.Children.Add(new TextBlock { Text = "可以点击“重试”，或关闭此标签页后重新打开邮件。", TextWrapping = TextWrapping.Wrap, Opacity = 0.7 });
+            panel.Children.Add(new TextBlock { Text = "点击“重试”会重新从服务器下载正文；也可以关闭此标签页后重新打开邮件。", TextWrapping = TextWrapping.Wrap, Opacity = 0.7 });
             panel.Children.Add(retry);
             host.Children.Add(panel);
         }
@@ -264,6 +310,11 @@ namespace KeeprawMail.Views
 
         private void CloseTab(TabViewItem tabItem)
         {
+            if (_tabLoads.Remove(tabItem, out var load))
+            {
+                load.Cancel(); // 不再需要的正文下载随之取消（同一邮件仍被其它请求等待时不受影响）
+                load.Dispose();
+            }
             if (tabItem.Tag is string id)
                 _openTabs.Remove(id);
             EmailTabView.TabItems.Remove(tabItem);
@@ -389,6 +440,8 @@ namespace KeeprawMail.Views
             if (EmailListView.SelectedItem is EmailMessage email && ViewModel.SelectedAccount != null)
             {
                 System.Diagnostics.Debug.WriteLine($"[MailPage] 回复邮件: {email.Subject}");
+                try { await ViewModel.EnsureBodyAvailableAsync(email, System.Threading.CancellationToken.None); }
+                catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"[MailPage] 正文按需下载失败，使用摘要: {ex.GetType().Name}"); }
                 
                 // 获取正文 (尝试从文件读取)
                 string body = "";
@@ -415,6 +468,8 @@ namespace KeeprawMail.Views
             if (EmailListView.SelectedItem is EmailMessage email && ViewModel.SelectedAccount != null)
             {
                 System.Diagnostics.Debug.WriteLine($"[MailPage] 转发邮件: {email.Subject}");
+                try { await ViewModel.EnsureBodyAvailableAsync(email, System.Threading.CancellationToken.None); }
+                catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"[MailPage] 正文按需下载失败，使用摘要: {ex.GetType().Name}"); }
                 
                 string body = "";
                 if (!string.IsNullOrEmpty(email.BodyLocalPath) && System.IO.File.Exists(email.BodyLocalPath))

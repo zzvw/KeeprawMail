@@ -207,7 +207,7 @@ public sealed class AccountRepository
 
     /// <summary>
     /// 删除账号（只删本地数据，不会删除邮箱服务器上的邮件）：
-    ///  1. 在一个 SQLite 事务中先删该账号的 Emails（删除触发器同步 FTS5），再删 Accounts 行；
+    ///  1. 在一个 SQLite 事务中先删该账号的 Emails（删除触发器同步 FTS5）与 MailboxSyncState，再删 Accounts 行；
     ///     任一步失败整体回滚，账号、邮件、凭据保持原样并抛出异常。
     ///  2. 事务提交后再删 DPAPI 凭据和本地正文缓存（只删应用缓存目录内的文件）。
     ///     这一步失败不会回滚数据库，而是写入 PendingCleanup，下次启动由 <see cref="RetryPendingCleanupAsync"/> 重试，
@@ -240,6 +240,9 @@ public sealed class AccountRepository
                     del.Parameters.AddWithValue("$Id", accountId);
                     emailsDeleted = await del.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
                 }
+
+                // 同步状态表引用 Accounts（外键），必须在删除账号行之前、同一事务内清理
+                await MailboxSyncStateStore.DeleteAsync(c, tx, accountId, null, ct).ConfigureAwait(false);
 
                 using (var del = c.CreateCommand())
                 {
@@ -287,7 +290,7 @@ public sealed class AccountRepository
         }
 
         if (pending.Count > 0)
-            await AddPendingCleanupAsync(accountId, pending, ct).ConfigureAwait(false);
+            await AddPendingCleanupAsync(_connectionString, accountId, pending, ct).ConfigureAwait(false);
 
         return new AccountDeletionResult(emailsDeleted, credentialsDeleted, filesDeleted, pending.Select(p => $"{p.Kind}:{p.Target}").ToList());
     }
@@ -344,9 +347,9 @@ public sealed class AccountRepository
         return items.Count - done.Count;
     }
 
-    private async Task AddPendingCleanupAsync(string accountId, List<(string Kind, string Target)> items, CancellationToken ct)
+    internal static async Task AddPendingCleanupAsync(string connectionString, string accountId, List<(string Kind, string Target)> items, CancellationToken ct)
     {
-        using var c = new SqliteConnection(_connectionString);
+        using var c = new SqliteConnection(connectionString);
         await c.OpenAsync(ct).ConfigureAwait(false);
         using (var ensure = c.CreateCommand())
         {
