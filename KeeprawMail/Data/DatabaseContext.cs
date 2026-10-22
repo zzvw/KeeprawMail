@@ -245,7 +245,8 @@ namespace KeeprawMail.Data
             }).ToList());
 
         /// <summary>
-        /// 获取列表邮件：每个账号各取最近 100 封（避免某个账号的大量新邮件把其它账号挤出列表），整体按日期倒序。
+        /// 获取默认首页（统一收件箱）邮件：每个账号的 INBOX 各取最近 100 封（避免某个账号的大量新邮件把其它账号挤出列表），整体按真实时间倒序。
+        /// 其它文件夹（Sent / Drafts / Trash / Junk / Archive）的邮件仍在本地保存，只是不在首页显示。
         /// </summary>
         public async Task<System.Collections.Generic.List<Models.EmailMessage>> GetEmailsAsync()
         {
