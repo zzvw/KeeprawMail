@@ -241,6 +241,7 @@ namespace KeeprawMail.Data
                 AccountId = e.AccountId ?? "",
                 IsStarred = e.IsStarred,
                 ImapUid = e.ImapUid,
+                PreviewState = e.PreviewState,
             }).ToList());
 
         /// <summary>
@@ -263,6 +264,7 @@ namespace KeeprawMail.Data
                 AccountId = r.AccountId,
                 IsStarred = r.IsStarred,
                 ImapUid = r.ImapUid,
+                PreviewState = r.PreviewState,
             }).ToList();
         }
 

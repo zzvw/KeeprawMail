@@ -41,6 +41,12 @@ jobs:
         run: |
           f=KeeprawMail.Core.Tests/bin/Release/net9.0/sync-request-comparison.txt
           if [ -f "$f" ]; then cat "$f"; mkdir -p TestResults; cp "$f" TestResults/; else echo "::error::comparison file missing"; exit 1; fi
+      - name: Preview request counts (PR3, measured)
+        if: always()
+        shell: bash
+        run: |
+          f=KeeprawMail.Core.Tests/bin/Release/net9.0/preview-request-metrics.txt
+          if [ -f "$f" ]; then cat "$f"; mkdir -p TestResults; cp "$f" TestResults/; else echo "::error::preview metrics file missing"; exit 1; fi
       - name: Repeat Tls_RevokedCertificate_Rejected 20x (Linux)
         shell: bash
         run: |

@@ -25,6 +25,37 @@ public enum FetchedBodyKind
 /// <summary>按需下载的正文（只含选中的 MIME 文本部分，不含附件）。</summary>
 public sealed record FetchedBody(FetchedBodyKind Kind, string Content, string? Charset, long DownloadedOctets);
 
+/// <summary>列表摘要预览的有界部分下载上限（按 MIME 部分的传输编码内容计，即 BODY.PEEK[section]&lt;offset.count&gt; 的 count）。</summary>
+public static class PreviewFetchLimits
+{
+    /// <summary>每封邮件第一次部分下载的字节数。</summary>
+    public const int InitialBytes = 4 * 1024;
+
+    /// <summary>每封邮件预览允许下载的总字节数（第一次 + 至多一次补充请求）。</summary>
+    public const int MaxBytesPerMessage = 8 * 1024;
+
+    /// <summary>每封邮件预览最多发出的部分下载请求数。</summary>
+    public const int MaxRequestsPerMessage = 2;
+}
+
+public enum PreviewFetchOutcome
+{
+    /// <summary>得到了有意义的纯文本摘要。</summary>
+    Ready,
+    /// <summary>没有可预览的正文部分（只有附件、加密、无 BODYSTRUCTURE），或有界字节内没有可用文本。不再重试。</summary>
+    NoText,
+    /// <summary>服务器上已找不到该 UID。</summary>
+    Missing,
+    /// <summary>该邮件的请求失败（可退避后重试）。</summary>
+    Failed,
+}
+
+/// <summary>一封邮件的预览结果。<see cref="TransferBytes"/> 是从服务器实际收到的部分内容字节数（MailKit 返回的流长度之和）。</summary>
+public sealed record FetchedPreview(uint Uid, PreviewFetchOutcome Outcome, string Snippet, int Requests, long TransferBytes, string? Error = null);
+
+/// <summary>同一文件夹一批邮件的预览结果；<see cref="UidValidity"/> 是本次 EXAMINE 返回的值，写库前用于确认 UID 仍指向同一封邮件。</summary>
+public sealed record MailboxPreviewBatch(string Mailbox, uint UidValidity, IReadOnlyList<FetchedPreview> Items);
+
 /// <summary>服务器上找不到该 UID（已被删除 / 移动）。</summary>
 public sealed class RemoteMessageNotFoundException(string message) : Exception(message);
 
@@ -61,4 +92,13 @@ public interface IImapMailSession : IAsyncDisposable
     /// 找不到 UID 时抛出 <see cref="RemoteMessageNotFoundException"/>。
     /// </summary>
     Task<FetchedBody> FetchBodyAsync(string mailboxName, uint uid, CancellationToken ct);
+
+    /// <summary>
+    /// 列表摘要预览（与 <see cref="FetchBodyAsync"/> 完全独立，互不调用）：
+    /// 一条 UID FETCH 批量取 BODYSTRUCTURE，按结构选择正文部分（优先 text/plain，其次 text/html；附件、message/rfc822、二进制部分不作为正文），
+    /// 然后对每封邮件发出有界部分下载 UID FETCH uid (BODY.PEEK[section]&lt;0.4096&gt;)；没有有意义文本时至多再请求一次，
+    /// 每封合计不超过 <see cref="PreviewFetchLimits.MaxBytesPerMessage"/> 字节。绝不下载整封邮件、完整正文或附件，不改变 \Seen。
+    /// 单封邮件失败只影响该封（<see cref="PreviewFetchOutcome.Failed"/>）；连接级错误抛出异常。
+    /// </summary>
+    Task<MailboxPreviewBatch> FetchPreviewsAsync(string mailboxName, IReadOnlyList<uint> uids, CancellationToken ct);
 }

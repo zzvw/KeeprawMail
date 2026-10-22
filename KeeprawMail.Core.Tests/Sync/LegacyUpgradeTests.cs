@@ -73,7 +73,8 @@ public class LegacyUpgradeTests : IDisposable
         await _db.Repo.EnsureSchemaAsync();
         await _db.Repo.EnsureSchemaAsync(); // 迁移可重复执行
 
-        Assert.Equal(3, await _db.ScalarAsync("PRAGMA user_version"));
+        Assert.Equal(MailStoreSchema.SchemaVersion, await _db.ScalarAsync("PRAGMA user_version")); // v2 → 当前版本（PR3 起为 4）
+        Assert.Equal(4, MailStoreSchema.SchemaVersion);
         Assert.Equal(5, await _db.ScalarAsync("SELECT COUNT(*) FROM Emails"));
         Assert.Equal(1, await _db.ScalarAsync("SELECT COUNT(*) FROM Accounts"));
         Assert.Equal(0, await _db.ScalarAsync("SELECT COUNT(*) FROM MailboxSyncState"));

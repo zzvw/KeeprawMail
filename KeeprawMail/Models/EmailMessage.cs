@@ -67,7 +67,7 @@ namespace KeeprawMail.Models
 
         private string _snippet = string.Empty;
         /// <summary>
-        /// 邮件摘要（正文按需下载后更新，支持通知）
+        /// 邮件摘要（纯文本；由后台预览任务的有界部分下载或打开正文时生成，支持通知）。绝不包含 HTML。
         /// </summary>
         public string Snippet
         {
@@ -75,14 +75,50 @@ namespace KeeprawMail.Models
             set
             {
                 if (SetProperty(ref _snippet, value ?? string.Empty))
+                {
                     OnPropertyChanged(nameof(SnippetDisplay));
+                    OnPropertyChanged(nameof(SnippetOpacity));
+                }
+            }
+        }
+
+        private KeeprawMail.Core.Storage.PreviewState _previewState = KeeprawMail.Core.Storage.PreviewState.Pending;
+        /// <summary>
+        /// 列表摘要预览状态（Pending / Ready / NoText / Failed），与数据库 Emails.PreviewState 一致。
+        /// </summary>
+        public KeeprawMail.Core.Storage.PreviewState PreviewState
+        {
+            get => _previewState;
+            set
+            {
+                if (SetProperty(ref _previewState, value))
+                {
+                    OnPropertyChanged(nameof(SnippetDisplay));
+                    OnPropertyChanged(nameof(SnippetOpacity));
+                }
             }
         }
 
         /// <summary>
-        /// 列表中显示的摘要：尚未下载正文的新邮件显示轻量占位文本（占位文本不写入数据库，也不进入全文索引）。
+        /// 列表中显示的摘要（纯文本 TextBlock，最多 3 行）：有摘要时显示摘要；否则按预览状态显示轻量提示。
+        /// 提示文本只用于显示，不写入数据库，也不进入全文索引。
         /// </summary>
-        public string SnippetDisplay => string.IsNullOrEmpty(_snippet) ? "（打开后加载正文）" : _snippet;
+        public string SnippetDisplay
+        {
+            get
+            {
+                if (!string.IsNullOrEmpty(_snippet)) return _snippet;
+                return _previewState switch
+                {
+                    KeeprawMail.Core.Storage.PreviewState.NoText => "无文本预览",
+                    KeeprawMail.Core.Storage.PreviewState.Failed => "预览暂不可用",
+                    _ => "正在加载预览…",
+                };
+            }
+        }
+
+        /// <summary>提示文本（非摘要）以较淡的样式显示。</summary>
+        public double SnippetOpacity => string.IsNullOrEmpty(_snippet) ? 0.6 : 1.0;
 
         /// <summary>
         /// 本地正文缓存路径（为空表示尚未下载，打开邮件时按需下载）

@@ -47,7 +47,7 @@ public sealed partial class EmailStore
 
                     using var u = c.CreateCommand();
                     u.Transaction = tx;
-                    u.CommandText = "UPDATE Emails SET BodyLocalPath = '', Snippet = '' WHERE AccountId = $A AND Mailbox = $M AND ImapUid = $U";
+                    u.CommandText = "UPDATE Emails SET BodyLocalPath = '', Snippet = '', PreviewState = 0, PreviewAttempts = 0, PreviewNextRetryAt = NULL WHERE AccountId = $A AND Mailbox = $M AND ImapUid = $U";
                     u.Parameters.AddWithValue("$A", accountId);
                     u.Parameters.AddWithValue("$M", mailboxName);
                     u.Parameters.AddWithValue("$U", (long)uid);
@@ -59,8 +59,8 @@ public sealed partial class EmailStore
             {
                 cmd.Transaction = tx;
                 cmd.CommandText = @"
-                    INSERT INTO Emails (Id, Subject, SenderName, SenderAddress, Date, Snippet, BodyLocalPath, IsRead, Mailbox, AccountId, IsStarred, ImapUid)
-                    VALUES ($Id, $Subject, $SenderName, $SenderAddress, $Date, '', '', $IsRead, $Mailbox, $AccountId, $IsStarred, $Uid)
+                    INSERT INTO Emails (Id, Subject, SenderName, SenderAddress, Date, Snippet, BodyLocalPath, IsRead, Mailbox, AccountId, IsStarred, ImapUid, PreviewState)
+                    VALUES ($Id, $Subject, $SenderName, $SenderAddress, $Date, '', '', $IsRead, $Mailbox, $AccountId, $IsStarred, $Uid, 0)
                     ON CONFLICT(Id) DO UPDATE SET
                         Subject = excluded.Subject, SenderName = excluded.SenderName, SenderAddress = excluded.SenderAddress,
                         Date = excluded.Date, IsRead = excluded.IsRead, IsStarred = excluded.IsStarred, ImapUid = excluded.ImapUid
@@ -350,15 +350,21 @@ public sealed partial class EmailStore
     }
 
     /// <summary>
-    /// 正文按需下载完成后只更新 BodyLocalPath 与 Snippet（FTS5 由更新触发器同步），
+    /// 正文按需下载完成后只更新 BodyLocalPath、Snippet 与预览状态（FTS5 由更新触发器同步），
     /// 不触碰同步期间写入的已读、星标、主题等元数据。返回是否找到该邮件（同步期间可能已被删除）。
+    /// 完整正文生成的摘要比有界预览更完整，因此覆盖预览摘要并把状态设为 Ready；完整正文没有文本且也没有预览摘要时为 NoText。
     /// </summary>
     public async Task<bool> UpdateBodyAsync(string emailId, string bodyLocalPath, string snippet, CancellationToken ct = default)
     {
         using var c = new SqliteConnection(Cs);
         await c.OpenAsync(ct).ConfigureAwait(false);
         using var cmd = c.CreateCommand();
-        cmd.CommandText = "UPDATE Emails SET BodyLocalPath = $P, Snippet = $S WHERE Id = $Id";
+        // 完整正文没有生成摘要时保留已有的预览摘要（不用空字符串覆盖有效摘要）
+        cmd.CommandText = @"UPDATE Emails SET BodyLocalPath = $P,
+            Snippet = CASE WHEN $S <> '' THEN $S ELSE IFNULL(Snippet, '') END,
+            PreviewState = CASE WHEN $S <> '' OR IFNULL(Snippet, '') <> '' THEN 1 ELSE 2 END,
+            PreviewAttempts = 0, PreviewNextRetryAt = NULL
+            WHERE Id = $Id";
         cmd.Parameters.AddWithValue("$Id", emailId);
         cmd.Parameters.AddWithValue("$P", bodyLocalPath ?? "");
         cmd.Parameters.AddWithValue("$S", snippet ?? "");

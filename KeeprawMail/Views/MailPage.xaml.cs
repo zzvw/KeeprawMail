@@ -451,7 +451,8 @@ namespace KeeprawMail.Views
                 }
                 else
                 {
-                    body = email.Snippet;
+                    // 摘要是纯文本：放进 HTML 撰写内容前先编码
+                    body = System.Net.WebUtility.HtmlEncode(email.Snippet);
                 }
 
                 // 构建引用原文
@@ -478,7 +479,8 @@ namespace KeeprawMail.Views
                 }
                 else
                 {
-                    body = email.Snippet;
+                    // 摘要是纯文本：放进 HTML 撰写内容前先编码
+                    body = System.Net.WebUtility.HtmlEncode(email.Snippet);
                 }
 
                 // 构建转发内容
