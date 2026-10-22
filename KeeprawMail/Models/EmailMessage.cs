@@ -38,32 +38,15 @@ namespace KeeprawMail.Models
         public DateTimeOffset Date { get; set; }
 
         /// <summary>
-        /// 智能时间显示 (替代 Converter)
+        /// 列表中的短时间（替代 Converter）：按 Windows 当前系统时区显示（今天 HH:mm / 昨天 / 星期 / MM-dd / yyyy-MM-dd，按本地日期判断）。
+        /// <see cref="Date"/> 保留原始绝对时间与偏移，只在显示时换算，见 <see cref="KeeprawMail.Core.Formatting.MailDateFormatter"/>。
         /// </summary>
-        public string DisplayDate
-        {
-            get
-            {
-                var now = DateTimeOffset.Now;
-                var diff = now - Date;
-
-                if (Date.Date == now.Date)
-                    return Date.ToString("HH:mm");
-                else if (Date.Date == now.Date.AddDays(-1))
-                    return "昨天";
-                else if (diff.TotalDays < 7)
-                    return Date.ToString("ddd");
-                else if (Date.Year == now.Year)
-                    return Date.ToString("MM-dd");
-                else
-                    return Date.ToString("yyyy-MM-dd");
-            }
-        }
+        public string DisplayDate => KeeprawMail.Core.Formatting.MailDateFormatter.System.FormatListDate(Date);
 
         /// <summary>
-        /// 完整时间提示 (用于 ToolTip)
+        /// 完整本地时间（列表 ToolTip、阅读器头部）：yyyy-MM-dd HH:mm:ss，Windows 当前系统时区。
         /// </summary>
-        public string FullDateTooltip => Date.ToString("yyyy-MM-dd HH:mm:ss");
+        public string FullDateTooltip => KeeprawMail.Core.Formatting.MailDateFormatter.System.FormatFull(Date);
 
         private string _snippet = string.Empty;
         /// <summary>
