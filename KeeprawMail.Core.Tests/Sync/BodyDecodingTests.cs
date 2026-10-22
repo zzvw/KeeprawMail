@@ -72,14 +72,15 @@ public class BodyDecodingTests
     }
 
     [Fact]
-    public void Snippet_StripsStyleScriptTagsEntities_Max200()
+    public void Snippet_StripsStyleScriptTagsEntities_MaxLength()
     {
         var html = "<html><head><title>T</title><style>p{color:red}</style></head><body><script>alert(1)</script><p>A&nbsp;&lt;b&gt;</p>\n\n<p>" + new string('x', 400) + "</p></body></html>";
         var s = SnippetBuilder.FromBody(html, true);
         Assert.StartsWith("A <b> xxx", s);
         Assert.DoesNotContain("color", s);
         Assert.DoesNotContain("alert", s);
-        Assert.Equal(200, s.Length);
+        Assert.Equal(SnippetBuilder.MaxLength, s.Length);
+        Assert.InRange(SnippetBuilder.MaxLength, 240, 300); // PR3：摘要上限 240–300 字符
         Assert.Equal("a b", SnippetBuilder.FromBody("a\r\n\t b", false));
     }
 

@@ -140,13 +140,15 @@
                                            TextTrimming="CharacterEllipsis"
                                            MaxLines="1"/>
                                 
-                                <!-- 摘要 -->
+                                <!-- 摘要：纯文本 TextBlock（不是 WebView2），最多 3 行，超出显示省略号；未就绪时显示预览状态提示 -->
                                 <TextBlock Text="{x:Bind SnippetDisplay, Mode=OneWay}" 
+                                           Opacity="{x:Bind SnippetOpacity, Mode=OneWay}"
                                            FontSize="12"
                                            Foreground="{ThemeResource SystemControlForegroundBaseMediumBrush}"
                                            TextTrimming="CharacterEllipsis"
-                                           MaxLines="2"
-                                           TextWrapping="Wrap"/>
+                                           MaxLines="3"
+                                           TextWrapping="Wrap"
+                                           IsTextSelectionEnabled="False"/>
                             </StackPanel>
                             
                             <!-- 时间戳 -->

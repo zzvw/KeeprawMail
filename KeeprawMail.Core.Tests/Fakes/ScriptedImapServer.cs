@@ -50,8 +50,20 @@ public sealed partial class ScriptedImapServer : IAsyncDisposable
 
     /// <summary>每条命令（不含 tag），如 "UID FETCH 1:500 (UID FLAGS ...)"。</summary>
     public ConcurrentQueue<string> Commands { get; } = new();
-    /// <summary>发送给客户端的 BODY[section] 内容字节数（按 section 记录）。</summary>
-    public ConcurrentQueue<(uint Uid, string Section, int Bytes)> SectionsSent { get; } = new();
+    /// <summary>
+    /// 发送给客户端的 BODY[section] 内容字节数（按 section 记录）。部分下载（BODY[section]&lt;offset.count&gt;）记录请求的 offset / count，
+    /// 完整下载时两者为 null。由此可以从服务器一侧证明：是否请求过完整正文 / 附件，每封邮件实际发送了多少内容字节。
+    /// </summary>
+    public ConcurrentQueue<(uint Uid, string Section, int Bytes, int? Offset, int? Count)> SectionsSent { get; } = new();
+
+    /// <summary>故障注入：对指定 UID 的部分下载返回 "NO"（单封失败）或 "DROP"（断开连接）；返回 null 时正常。</summary>
+    public Func<uint, string?>? PartialFetchFault { get; set; }
+
+    /// <summary>
+    /// 故障注入：UID FETCH … BODYSTRUCTURE 的 UID 集合中只要有一个 UID 使其返回 true，整条命令就回答
+    /// "NO Some messages could not be FETCHed (Failure)"（Gmail 在集合中某一封无法取出时的真实行为），不返回任何数据。
+    /// </summary>
+    public Func<uint, bool>? StructureFetchFault { get; set; }
     public long BytesSent;
 
     public ScriptedImapServer()
@@ -191,6 +203,20 @@ public sealed partial class ScriptedImapServer : IAsyncDisposable
                     else if ((upper.StartsWith("UID FETCH") || upper.StartsWith("FETCH")) && selected != null)
                     {
                         var byUid = upper.StartsWith("UID ");
+                        if (PartialFetchFault is { } fault && byUid)
+                        {
+                            var fm = Regex.Match(rest, @"^UID FETCH (\d+) \(BODY\.PEEK\[[^\]]*\]<\d+\.\d+>\)$", RegexOptions.IgnoreCase);
+                            var action = fm.Success ? fault(uint.Parse(fm.Groups[1].Value, CultureInfo.InvariantCulture)) : null;
+                            if (action == "NO") { await WriteAsync(stream, $"{tag} NO [SERVERBUG] injected failure\r\n"); continue; }
+                            if (action == "DROP") return;
+                        }
+                        if (StructureFetchFault is { } sf && byUid && upper.Contains("BODYSTRUCTURE"))
+                        {
+                            var setArg = rest["UID FETCH ".Length..].Split(' ')[0];
+                            bool hit;
+                            lock (_gate) hit = MatchUidSet(selected.Messages.Select(m => m.Uid).ToList(), setArg).Any(sf);
+                            if (hit) { await WriteAsync(stream, $"{tag} NO Some messages could not be FETCHed (Failure)\r\n"); continue; }
+                        }
                         var bytes = HandleFetch(selected, rest[(byUid ? "UID FETCH ".Length : "FETCH ".Length)..], byUid);
                         await WriteBytesAsync(stream, bytes);
                         await WriteAsync(stream, $"{tag} OK fetch done\r\n");
@@ -357,14 +383,17 @@ public sealed partial class ScriptedImapServer : IAsyncDisposable
                                 var section = bm.Groups[2].Value;
                                 var data = Section(m, section);
                                 var origin = "";
+                                int? offset = null, count = null;
                                 if (bm.Groups[3].Success)
                                 {
                                     var start = int.Parse(bm.Groups[4].Value, CultureInfo.InvariantCulture);
                                     var len = int.Parse(bm.Groups[5].Value, CultureInfo.InvariantCulture);
                                     data = data.Skip(start).Take(len).ToArray();
                                     origin = $"<{start}>";
+                                    offset = start;
+                                    count = len;
                                 }
-                                SectionsSent.Enqueue((m.Uid, section, data.Length));
+                                SectionsSent.Enqueue((m.Uid, section, data.Length, offset, count));
                                 parts.Add(Concat(Encoding.ASCII.GetBytes($"BODY[{section}]{origin} {{{data.Length}}}\r\n"), data));
                                 if (bm.Groups[1].Success == false) m.Seen = true; // 非 PEEK 会设置 \Seen
                             }
@@ -500,7 +529,9 @@ public sealed partial class ScriptedImapServer : IAsyncDisposable
             {
                 var content = ContentBytes(part);
                 var ct = part.ContentType;
-                var cte = part.ContentTransferEncoding switch
+                // 与真实服务器一样报告邮件头中声明的传输编码原文（包括 "8-bit"、"x-uuencode" 等非标准值）；没有声明时按 MimeKit 的编码
+                var declaredCte = part.Headers[HeaderId.ContentTransferEncoding];
+                var cte = !string.IsNullOrWhiteSpace(declaredCte) ? declaredCte.Trim().ToUpperInvariant() : part.ContentTransferEncoding switch
                 {
                     ContentEncoding.Base64 => "BASE64",
                     ContentEncoding.QuotedPrintable => "QUOTED-PRINTABLE",
@@ -523,10 +554,30 @@ public sealed partial class ScriptedImapServer : IAsyncDisposable
                 fields.Add(Encoding.ASCII.GetBytes("NIL NIL"));
                 return Concat(Encoding.ASCII.GetBytes("("), Join(fields), Encoding.ASCII.GetBytes(")"));
             }
+            case MessagePart mp:
+            {
+                // body-type-msg：MESSAGE RFC822 参数 id desc enc octets envelope body lines，随后扩展字段 md5 dsp lang loc
+                var content = ContentBytes(mp);
+                var fields = new List<byte[]>
+                {
+                    NString(mp.ContentType.MediaType), NString(mp.ContentType.MediaSubtype), Params(mp.ContentType.Parameters),
+                    Encoding.ASCII.GetBytes("NIL NIL"), NString("7BIT"), Encoding.ASCII.GetBytes(content.Length.ToString(CultureInfo.InvariantCulture)),
+                    Envelope(mp.Message!), BodyStructure(mp.Message!.Body!), Encoding.ASCII.GetBytes(CountLines(content).ToString(CultureInfo.InvariantCulture)),
+                    Encoding.ASCII.GetBytes("NIL"),
+                    mp.ContentDisposition == null
+                        ? Encoding.ASCII.GetBytes("NIL")
+                        : Concat(Encoding.ASCII.GetBytes("("), Join(new[] { NString(mp.ContentDisposition.Disposition), Params(mp.ContentDisposition.Parameters) }), Encoding.ASCII.GetBytes(")")),
+                    Encoding.ASCII.GetBytes("NIL NIL"),
+                };
+                return Concat(Encoding.ASCII.GetBytes("("), Join(fields), Encoding.ASCII.GetBytes(")"));
+            }
             default:
                 throw new NotSupportedException(entity.GetType().Name);
         }
     }
+
+    /// <summary>某封邮件发送的全部 BODY[...] 内容字节数。</summary>
+    public long SectionBytesFor(uint uid) => SectionsSent.Where(x => x.Uid == uid).Sum(x => (long)x.Bytes);
 
     private static int CountLines(byte[] b) => b.Count(x => x == (byte)'\n');
 

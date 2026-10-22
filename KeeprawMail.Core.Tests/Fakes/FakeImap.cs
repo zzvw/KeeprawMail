@@ -71,7 +71,11 @@ public sealed class FakeImapServer
     public bool CondStore { get; set; }
     public bool QResync { get; set; }
 
-    public int Opens, SearchFrom, SearchAll, MetadataFetches, MetadataMessages, FlagFetches, FlagMessages, BodyFetches, SessionsCreated;
+    public int Opens, SearchFrom, SearchAll, MetadataFetches, MetadataMessages, FlagFetches, FlagMessages, BodyFetches, SessionsCreated, PreviewFetches, PreviewMessages;
+    public List<(string Mailbox, IReadOnlyList<uint> Uids)> PreviewRequests { get; } = new();
+
+    /// <summary>故障注入：预览请求抛出的异常（为 null 时正常）。</summary>
+    public Func<Exception>? PreviewFailure { get; set; }
     public long AttachmentBytesDownloaded;
     public List<(uint Min, uint Max, ulong? ChangedSince)> FlagRequests { get; } = new();
     public List<IReadOnlyList<uint>> MetadataRequests { get; } = new();
@@ -92,7 +96,8 @@ public sealed class FakeImapServer
 
     public void ResetCounters()
     {
-        Opens = SearchFrom = SearchAll = MetadataFetches = MetadataMessages = FlagFetches = FlagMessages = BodyFetches = SessionsCreated = 0;
+        Opens = SearchFrom = SearchAll = MetadataFetches = MetadataMessages = FlagFetches = FlagMessages = BodyFetches = SessionsCreated = PreviewFetches = PreviewMessages = 0;
+        lock (PreviewRequests) PreviewRequests.Clear();
         AttachmentBytesDownloaded = 0;
         FlagRequests.Clear();
         MetadataRequests.Clear();
@@ -194,6 +199,29 @@ public sealed class FakeImapSession : IImapMailSession
         lock (mb) mb.Messages.TryGetValue(uid, out m);
         if (m == null) throw new RemoteMessageNotFoundException("服务器上已找不到这封邮件");
         return new FetchedBody(m.BodyKind, m.Body, "utf-8", m.Body.Length);
+    }
+
+    public Task<MailboxPreviewBatch> FetchPreviewsAsync(string mailboxName, IReadOnlyList<uint> uids, CancellationToken ct)
+    {
+        Interlocked.Increment(ref _server.PreviewFetches);
+        lock (_server.PreviewRequests) _server.PreviewRequests.Add((mailboxName, uids.ToList()));
+        if (_server.PreviewFailure is { } fail) throw fail();
+        if (!_server.Mailboxes.TryGetValue(mailboxName, out var mb)) throw new IOException("no mailbox");
+        var items = new List<FetchedPreview>();
+        lock (mb)
+        {
+            foreach (var uid in uids.Distinct())
+            {
+                Interlocked.Increment(ref _server.PreviewMessages);
+                if (!mb.Messages.TryGetValue(uid, out var m)) { items.Add(new FetchedPreview(uid, PreviewFetchOutcome.Missing, "", 0, 0)); continue; }
+                if (m.BodyKind == FetchedBodyKind.NoTextBody) { items.Add(new FetchedPreview(uid, PreviewFetchOutcome.NoText, "", 0, 0)); continue; }
+                var snippet = SnippetBuilder.FromBody(m.Body, m.BodyKind == FetchedBodyKind.Html);
+                items.Add(PreviewTextExtractor.IsMeaningful(snippet)
+                    ? new FetchedPreview(uid, PreviewFetchOutcome.Ready, snippet, 1, Math.Min(m.Body.Length, PreviewFetchLimits.InitialBytes))
+                    : new FetchedPreview(uid, PreviewFetchOutcome.NoText, "", 1, Math.Min(m.Body.Length, PreviewFetchLimits.InitialBytes)));
+            }
+            return Task.FromResult(new MailboxPreviewBatch(mb.Name, mb.UidValidity, items));
+        }
     }
 
     public ValueTask DisposeAsync()

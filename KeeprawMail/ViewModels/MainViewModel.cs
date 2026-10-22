@@ -24,6 +24,8 @@ namespace KeeprawMail.ViewModels
         {
             _databaseContext = databaseContext;
             _imapService = new Services.ImapService();
+            // 在 UI 线程上构造：后台预览任务的结果通过它回到 UI 线程更新列表项
+            _uiContext = System.Threading.SynchronizationContext.Current;
             Emails = new ObservableCollection<EmailMessage>();
             
             // 从数据库加载邮件
@@ -97,7 +99,20 @@ namespace KeeprawMail.ViewModels
                 Emails.Clear();
                 foreach (var email in localEmails)
                 {
+                    // 读库期间后台预览刚写入的结果：补到新列表项上（否则会被读到的旧状态覆盖）
+                    if (_recentPreviewUpdates.TryGetValue(email.Id, out var update) && email.PreviewState is not Core.Storage.PreviewState.Ready)
+                        ApplyPreview(email, update);
                     Emails.Add(email);
+                }
+                _recentPreviewUpdates.Clear();
+
+                // 启动后第一次加载列表：为列表中的每个账号安排一次后台预览（不阻塞界面，失败不影响列表）。
+                // 没有 Pending / 到期 Failed 的账号不会建立任何连接；旧算法留下的“有正文缓存的 NoText”在这一轮从本地缓存重算（零网络，只做一次）。
+                if (!_startupPreviewsScheduled)
+                {
+                    _startupPreviewsScheduled = true;
+                    foreach (var accountId in Emails.Select(e => e.AccountId).Distinct().ToList())
+                        SchedulePreviews(accountId);
                 }
                 
                 if (updateStatus)
@@ -201,14 +216,89 @@ namespace KeeprawMail.ViewModels
         private Core.Reading.OnDemandBodyLoader BodyLoader => _bodyLoader ??= new Core.Reading.OnDemandBodyLoader(
             _databaseContext.CreateEmailStore(),
             Data.AppPaths.BodyCache,
-            async (accountId, ct) =>
-            {
-                // 按邮件所属账号连接（不是当前选中的账号），走该账号自己的代理与 TokenManager
-                var account = (await _databaseContext.GetAccountsAsync()).FirstOrDefault(a => a.Id == accountId)
-                    ?? throw new MailSyncException(SyncStage.ResolveProxy, "找不到这封邮件所属的账号（可能已被删除）。");
-                return await Services.ImapService.OpenSessionAsync(account, ct);
-            },
+            OpenAccountSessionAsync,
             line => DiagnosticLog.Write("reader", line));
+
+        /// <summary>
+        /// 按账号建立已认证会话（按需正文与后台预览共用同一连接路径）：
+        /// 按邮件所属账号连接（不是当前选中的账号），走该账号自己的代理与 TokenManager。
+        /// </summary>
+        private async System.Threading.Tasks.Task<Core.Imap.IImapMailSession> OpenAccountSessionAsync(string accountId, System.Threading.CancellationToken ct)
+        {
+            var account = (await _databaseContext.GetAccountsAsync()).FirstOrDefault(a => a.Id == accountId)
+                ?? throw new MailSyncException(SyncStage.ResolveProxy, "找不到这封邮件所属的账号（可能已被删除）。");
+            return await Services.ImapService.OpenSessionAsync(account, ct);
+        }
+
+        // ---- 列表摘要预览（实现见 KeeprawMail.Core.Preview.MailPreviewService；与同步、与打开正文是互相独立的流程）----
+
+        private readonly System.Threading.SynchronizationContext? _uiContext;
+        private Core.Preview.MailPreviewService? _previewService;
+        private bool _startupPreviewsScheduled;
+
+        /// <summary>最近一次列表重载之后收到的预览结果（只在 UI 线程上读写）。</summary>
+        private readonly System.Collections.Generic.Dictionary<string, Core.Storage.AppliedPreview> _recentPreviewUpdates = new();
+
+        private Core.Preview.MailPreviewService PreviewService
+        {
+            get
+            {
+                if (_previewService != null) return _previewService;
+                var service = new Core.Preview.MailPreviewService(
+                    _databaseContext.CreateEmailStore(),
+                    OpenAccountSessionAsync,
+                    new Core.Preview.MailPreviewOptions { PerAccountLimit = Core.Storage.EmailStore.DefaultPerAccountLimit },
+                    log: line => DiagnosticLog.Write("preview", line),
+                    bodyCache: Data.AppPaths.BodyCache);
+                service.PreviewsUpdated += OnPreviewsUpdated;
+                _previewService = service;
+                return service;
+            }
+        }
+
+        /// <summary>为一个账号安排后台预览（同一账号重复请求会合并；不阻塞调用方，任何失败只记日志）。</summary>
+        private void SchedulePreviews(string accountId)
+        {
+            if (string.IsNullOrEmpty(accountId)) return;
+            try
+            {
+                _ = PreviewService.RequestAsync(accountId);
+            }
+            catch (System.Exception ex)
+            {
+                DiagnosticLog.Write("preview", $"schedule failed: {ex.GetType().Name}");
+            }
+        }
+
+        /// <summary>后台线程上的预览结果 → UI 线程：立即更新列表项（无需打开邮件）。</summary>
+        private void OnPreviewsUpdated(object? sender, System.Collections.Generic.IReadOnlyList<Core.Storage.AppliedPreview> updates)
+        {
+            void Apply(object? _)
+            {
+                foreach (var update in updates)
+                {
+                    _recentPreviewUpdates[update.EmailId] = update;
+                    foreach (var email in Emails)
+                    {
+                        if (email.Id == update.EmailId)
+                        {
+                            ApplyPreview(email, update);
+                            break;
+                        }
+                    }
+                }
+            }
+            if (_uiContext != null) _uiContext.Post(Apply, null);
+            else Apply(null);
+        }
+
+        private static void ApplyPreview(EmailMessage email, Core.Storage.AppliedPreview update)
+        {
+            // 已打开过正文（有缓存）且已有摘要的邮件以正文生成的摘要为准；有缓存但没有摘要的（旧算法 NoText）接受本地重算结果
+            if (!string.IsNullOrEmpty(email.BodyLocalPath) && !string.IsNullOrEmpty(email.Snippet)) return;
+            if (update.State == Core.Storage.PreviewState.Ready) email.Snippet = update.Snippet;
+            email.PreviewState = update.State;
+        }
 
         /// <summary>
         /// 同步单个账号：连接 → 认证 → 列举文件夹 → 每个文件夹按 UIDVALIDITY + UID 游标增量同步元数据与 Flags。
@@ -229,8 +319,20 @@ namespace KeeprawMail.ViewModels
                     _ => $"正在同步 {account.Email} / {p.Mailbox}...",
                 };
             });
-            return SyncService.SyncAsync(account.Id, account.Email,
+            return SyncThenSchedulePreviewsAsync(account, progress);
+        }
+
+        /// <summary>
+        /// 元数据同步完成后（不等预览）再为该账号安排后台预览：同步的结果与耗时不受预览影响，预览失败也不会把成功的同步变成失败。
+        /// 只要有文件夹同步成功（含部分成功）就安排；新到的邮件按时间倒序优先。
+        /// </summary>
+        private async Task<AccountSyncReport> SyncThenSchedulePreviewsAsync(Models.AccountProfile account, System.IProgress<MailboxSyncProgress> progress)
+        {
+            var report = await SyncService.SyncAsync(account.Id, account.Email,
                 ct => Services.ImapService.ConnectForSyncAsync(account, ct), progress);
+            if (report.Status != AccountSyncStatus.Failed)
+                SchedulePreviews(account.Id);
+            return report;
         }
 
         /// <summary>
@@ -247,6 +349,9 @@ namespace KeeprawMail.ViewModels
                 email.BodyLocalPath = result.BodyLocalPath;
                 if (!string.IsNullOrEmpty(result.Snippet) && (!result.FromCache || string.IsNullOrEmpty(email.Snippet)))
                     email.Snippet = result.Snippet;
+                // 与数据库一致（UpdateBodyAsync）：有摘要 ⇒ Ready；完整正文也没有文本 ⇒ NoText
+                if (!result.FromCache)
+                    email.PreviewState = string.IsNullOrEmpty(email.Snippet) ? Core.Storage.PreviewState.NoText : Core.Storage.PreviewState.Ready;
             }
             else
             {
