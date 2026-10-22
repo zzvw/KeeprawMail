@@ -24,8 +24,24 @@ public sealed class AccountSyncReport
     public MailSyncException? Fatal { get; set; }
     public List<string> FoldersSucceeded { get; } = new();
     public List<FolderFailure> FolderFailures { get; } = new();
+    /// <summary>本次同步新增（新写入本地）的邮件数。</summary>
     public int EmailCount { get; set; }
     public int BodyFailures { get; set; }
+
+    /// <summary>本次同步更新的已读 / 星标状态数。</summary>
+    public int FlagUpdates { get; set; }
+
+    /// <summary>本次确认服务器已不存在、从本地移除的邮件数（只删本地）。</summary>
+    public int RemovedLocal { get; set; }
+
+    /// <summary>因 UIDVALIDITY 变化而重建的文件夹。</summary>
+    public List<string> UidValidityResets { get; } = new();
+
+    private string Changes() =>
+        $"新增 {EmailCount} 封" +
+        (FlagUpdates > 0 ? $"，状态更新 {FlagUpdates} 封" : "") +
+        (RemovedLocal > 0 ? $"，移除已删除 {RemovedLocal} 封" : "") +
+        (UidValidityResets.Count > 0 ? $"，重建文件夹 {string.Join("、", UidValidityResets)}（UIDVALIDITY 变化）" : "");
 
     public AccountSyncStatus Status
     {
@@ -44,8 +60,8 @@ public sealed class AccountSyncReport
     /// <summary>给用户看的一行说明。</summary>
     public string Describe() => Status switch
     {
-        AccountSyncStatus.Success => $"{Email}：同步成功，{EmailCount} 封邮件。",
-        AccountSyncStatus.Partial => $"{Email}：部分成功，{EmailCount} 封邮件；" +
+        AccountSyncStatus.Success => $"{Email}：同步成功，{Changes()}。",
+        AccountSyncStatus.Partial => $"{Email}：部分成功，{Changes()}；" +
             string.Join("；", FolderFailures.Select(f => $"文件夹 {f.Folder} 失败于[{SyncStageNames.Display(f.Stage)}] {f.Message}")
                 .Concat(BodyFailures > 0 ? [$"{BodyFailures} 封正文下载失败"] : [])),
         _ => Fatal != null
@@ -65,7 +81,7 @@ public static class SyncSummary
         var total = reports.Sum(r => r.EmailCount);
 
         if (failed.Count == 0 && partial == 0)
-            return $"同步完成：{ok}/{reports.Count} 个账号成功，共 {total} 封邮件。";
+            return $"同步完成：{ok}/{reports.Count} 个账号成功，新增 {total} 封邮件。";
 
         var head = failed.Count > 0
             ? $"同步有失败：{failed.Count}/{reports.Count} 个账号失败"

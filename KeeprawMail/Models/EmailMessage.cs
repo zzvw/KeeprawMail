@@ -65,15 +65,34 @@ namespace KeeprawMail.Models
         /// </summary>
         public string FullDateTooltip => Date.ToString("yyyy-MM-dd HH:mm:ss");
 
+        private string _snippet = string.Empty;
         /// <summary>
-        /// 邮件摘要
+        /// 邮件摘要（正文按需下载后更新，支持通知）
         /// </summary>
-        public string Snippet { get; set; } = string.Empty;
+        public string Snippet
+        {
+            get => _snippet;
+            set
+            {
+                if (SetProperty(ref _snippet, value ?? string.Empty))
+                    OnPropertyChanged(nameof(SnippetDisplay));
+            }
+        }
 
         /// <summary>
-        /// 本地存储路径
+        /// 列表中显示的摘要：尚未下载正文的新邮件显示轻量占位文本（占位文本不写入数据库，也不进入全文索引）。
+        /// </summary>
+        public string SnippetDisplay => string.IsNullOrEmpty(_snippet) ? "（打开后加载正文）" : _snippet;
+
+        /// <summary>
+        /// 本地正文缓存路径（为空表示尚未下载，打开邮件时按需下载）
         /// </summary>
         public string BodyLocalPath { get; set; } = string.Empty;
+
+        /// <summary>
+        /// IMAP UID（为 null 时从 Id 解析）
+        /// </summary>
+        public uint? ImapUid { get; set; }
 
         private bool _isRead;
         /// <summary>

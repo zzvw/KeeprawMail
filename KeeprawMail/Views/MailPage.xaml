@@ -141,7 +141,7 @@
                                            MaxLines="1"/>
                                 
                                 <!-- 摘要 -->
-                                <TextBlock Text="{x:Bind Snippet}" 
+                                <TextBlock Text="{x:Bind SnippetDisplay, Mode=OneWay}" 
                                            FontSize="12"
                                            Foreground="{ThemeResource SystemControlForegroundBaseMediumBrush}"
                                            TextTrimming="CharacterEllipsis"

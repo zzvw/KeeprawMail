@@ -16,6 +16,9 @@ public sealed record StoredEmail
     public string Mailbox { get; init; } = "Inbox";
     public string AccountId { get; init; } = "";
     public bool IsStarred { get; init; }
+
+    /// <summary>IMAP UID（UIDVALIDITY 范围内唯一）。为 null 时从 <see cref="Id"/> 解析（旧数据）。</summary>
+    public uint? ImapUid { get; init; }
 }
 
 /// <summary>
@@ -26,8 +29,13 @@ public sealed record StoredEmail
 /// </summary>
 public static class MailStoreSchema
 {
-    /// <summary>当前结构版本（PRAGMA user_version）。升级到 2 时重建一次 FTS，清除历史 REPLACE 留下的残留。</summary>
-    public const int SchemaVersion = 2;
+    /// <summary>
+    /// 当前结构版本（PRAGMA user_version）。
+    ///  * 2：重建一次 FTS，清除历史 REPLACE 留下的残留；
+    ///  * 3：Emails 增加 ImapUid 列（从旧 Id 回填）与 (AccountId, Mailbox, ImapUid) 索引，新增 MailboxSyncState 表。
+    /// 每一步都是幂等的（IF NOT EXISTS / 列存在检查 / 只回填 NULL），重复执行不会删除任何账号、邮件、正文缓存或凭据。
+    /// </summary>
+    public const int SchemaVersion = 3;
 
     public const string EmailsTableSql = @"
         CREATE TABLE IF NOT EXISTS Emails (
@@ -42,6 +50,7 @@ public static class MailStoreSchema
             Mailbox TEXT,
             AccountId TEXT,
             IsStarred INTEGER DEFAULT 0,
+            ImapUid INTEGER,
             FOREIGN KEY(AccountId) REFERENCES Accounts(Id)
         );";
 
@@ -80,7 +89,40 @@ public static class MailStoreSchema
             CreatedAt TEXT NOT NULL
         );";
 
-    /// <summary>建 Emails / FTS / 触发器 / PendingCleanup（幂等）。需要 Accounts 表已存在。</summary>
+    /// <summary>
+    /// 每账号、每文件夹的同步状态。UIDVALIDITY 与 UID 都是 32 位无符号整数，存 INTEGER（64 位有符号）不会丢精度；
+    /// MODSEQ 是 63 位无符号整数（RFC 7162），以十进制 TEXT 保存，读写都按 ulong 解析，彻底避免精度问题。
+    /// MailboxName 是服务器返回的完整名称，按 BINARY 比较（不做大小写折叠、不做分割）。
+    /// </summary>
+    public const string MailboxSyncStateTableSql = @"
+        CREATE TABLE IF NOT EXISTS MailboxSyncState (
+            AccountId TEXT NOT NULL,
+            MailboxName TEXT NOT NULL,
+            UidValidity INTEGER NOT NULL,
+            LastProcessedUid INTEGER NOT NULL DEFAULT 0,
+            HighestModSeq TEXT,
+            LastSuccessfulSyncAt TEXT,
+            LastFullReconcileAt TEXT,
+            PRIMARY KEY (AccountId, MailboxName),
+            FOREIGN KEY(AccountId) REFERENCES Accounts(Id)
+        );";
+
+    private const string UidIndexSql = "CREATE INDEX IF NOT EXISTS IX_Emails_Account_Mailbox_Uid ON Emails(AccountId, Mailbox, ImapUid);";
+
+    /// <summary>
+    /// 旧数据回填 ImapUid：Id 必须严格等于 AccountId || '|' || Mailbox || '|' || 十进制 UID，且 UID 在 uint32 范围内。
+    /// 不符合格式的行保持 NULL（同步时视为本地陈旧行，由基线核对处理），不会被误解析。
+    /// </summary>
+    private const string BackfillUidSql = @"
+        UPDATE Emails SET ImapUid = CAST(substr(Id, length(AccountId) + length(Mailbox) + 3) AS INTEGER)
+        WHERE ImapUid IS NULL
+          AND AccountId IS NOT NULL AND Mailbox IS NOT NULL
+          AND substr(Id, 1, length(AccountId) + length(Mailbox) + 2) = AccountId || '|' || Mailbox || '|'
+          AND length(substr(Id, length(AccountId) + length(Mailbox) + 3)) BETWEEN 1 AND 10
+          AND substr(Id, length(AccountId) + length(Mailbox) + 3) NOT GLOB '*[^0-9]*'
+          AND CAST(substr(Id, length(AccountId) + length(Mailbox) + 3) AS INTEGER) BETWEEN 1 AND 4294967295;";
+
+    /// <summary>建 Emails / FTS / 触发器 / PendingCleanup / MailboxSyncState（幂等）。需要 Accounts 表已存在。</summary>
     public static async Task EnsureAsync(SqliteConnection c, CancellationToken ct = default)
     {
         foreach (var sql in new[] { EmailsTableSql, FtsSql, InsertTriggerSql, DeleteTriggerSql, UpdateTriggerSql, PendingCleanupTableSql })
@@ -111,16 +153,39 @@ public static class MailStoreSchema
             cmd.CommandText = "PRAGMA user_version";
             version = (long)(await cmd.ExecuteScalarAsync(ct).ConfigureAwait(false) ?? 0L);
         }
-        if (version < SchemaVersion)
+
+        // ---- v2：重建 FTS（只在从更早版本升级时执行一次）----
+        if (version < 2)
         {
             using var cmd = c.CreateCommand();
-            cmd.CommandText = $"INSERT INTO Emails_FTS(Emails_FTS) VALUES('rebuild'); PRAGMA user_version = {SchemaVersion};";
+            cmd.CommandText = "INSERT INTO Emails_FTS(Emails_FTS) VALUES('rebuild');";
             await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
         }
+
+        // ---- v3：ImapUid 列 + 索引 + 同步状态表（每一步幂等，每次启动都检查）----
+        using (var tx = c.BeginTransaction())
+        {
+            if (!cols.Contains("ImapUid"))
+                await ExecAsync(c, tx, "ALTER TABLE Emails ADD COLUMN ImapUid INTEGER", ct).ConfigureAwait(false);
+            await ExecAsync(c, tx, BackfillUidSql, ct).ConfigureAwait(false);
+            await ExecAsync(c, tx, UidIndexSql, ct).ConfigureAwait(false);
+            await ExecAsync(c, tx, MailboxSyncStateTableSql, ct).ConfigureAwait(false);
+            if (version < SchemaVersion)
+                await ExecAsync(c, tx, $"PRAGMA user_version = {SchemaVersion};", ct).ConfigureAwait(false);
+            await tx.CommitAsync(ct).ConfigureAwait(false);
+        }
+    }
+
+    private static async Task ExecAsync(SqliteConnection c, SqliteTransaction tx, string sql, CancellationToken ct)
+    {
+        using var cmd = c.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = sql;
+        await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
     }
 }
 
-public sealed class EmailStore
+public sealed partial class EmailStore
 {
     private readonly string _connectionString;
 
@@ -129,7 +194,7 @@ public sealed class EmailStore
     /// <summary>列表默认每个账号最多显示的邮件数（完整分页留给后续 PR）。</summary>
     public const int DefaultPerAccountLimit = 100;
 
-    private const string Columns = "Id, Subject, SenderName, SenderAddress, Date, Snippet, BodyLocalPath, IsRead, Mailbox, AccountId, IsStarred";
+    private const string Columns = "Id, Subject, SenderName, SenderAddress, Date, Snippet, BodyLocalPath, IsRead, Mailbox, AccountId, IsStarred, ImapUid";
 
     public async Task SaveAsync(IEnumerable<StoredEmail> emails, CancellationToken ct = default)
     {
@@ -140,14 +205,16 @@ public sealed class EmailStore
         cmd.Transaction = tx;
         cmd.CommandText = $@"
             INSERT INTO Emails ({Columns})
-            VALUES ($Id, $Subject, $SenderName, $SenderAddress, $Date, $Snippet, $BodyLocalPath, $IsRead, $Mailbox, $AccountId, $IsStarred)
+            VALUES ($Id, $Subject, $SenderName, $SenderAddress, $Date, $Snippet, $BodyLocalPath, $IsRead, $Mailbox, $AccountId, $IsStarred, $ImapUid)
             ON CONFLICT(Id) DO UPDATE SET
                 Subject = excluded.Subject, SenderName = excluded.SenderName, SenderAddress = excluded.SenderAddress,
                 Date = excluded.Date, Snippet = excluded.Snippet, BodyLocalPath = excluded.BodyLocalPath,
-                IsRead = excluded.IsRead, Mailbox = excluded.Mailbox, AccountId = excluded.AccountId, IsStarred = excluded.IsStarred";
+                IsRead = excluded.IsRead, Mailbox = excluded.Mailbox, AccountId = excluded.AccountId, IsStarred = excluded.IsStarred,
+                ImapUid = excluded.ImapUid";
         var p = new Dictionary<string, SqliteParameter>();
         foreach (var name in new[] { "$Id", "$Subject", "$SenderName", "$SenderAddress", "$Date", "$Snippet", "$BodyLocalPath", "$IsRead", "$Mailbox", "$AccountId", "$IsStarred" })
             p[name] = cmd.Parameters.Add(name, SqliteType.Text);
+        p["$ImapUid"] = cmd.Parameters.Add("$ImapUid", SqliteType.Integer);
 
         foreach (var e in emails)
         {
@@ -162,6 +229,8 @@ public sealed class EmailStore
             p["$Mailbox"].Value = string.IsNullOrEmpty(e.Mailbox) ? "Inbox" : e.Mailbox;
             p["$AccountId"].Value = e.AccountId ?? "";
             p["$IsStarred"].Value = e.IsStarred ? 1 : 0;
+            var uid = e.ImapUid ?? EmailIdentity.TryParseUid(e.Id, e.AccountId ?? "", string.IsNullOrEmpty(e.Mailbox) ? "Inbox" : e.Mailbox);
+            p["$ImapUid"].Value = uid.HasValue ? (long)uid.Value : DBNull.Value;
             await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
         }
         await tx.CommitAsync(ct).ConfigureAwait(false);
@@ -238,6 +307,7 @@ public sealed class EmailStore
                 Mailbox = r.IsDBNull(8) ? "" : r.GetString(8),
                 AccountId = r.IsDBNull(9) ? "" : r.GetString(9),
                 IsStarred = !r.IsDBNull(10) && r.GetInt64(10) == 1,
+                ImapUid = r.IsDBNull(11) ? null : (uint)r.GetInt64(11),
             });
         }
         return list;

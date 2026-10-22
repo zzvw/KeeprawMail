@@ -1,4 +1,5 @@
 using KeeprawMail.Models;
+using KeeprawMail.Core.Imap;
 using KeeprawMail.Core.Networking;
 using KeeprawMail.Core.Sync;
 using MailKit;
@@ -22,7 +23,6 @@ namespace KeeprawMail.Services
     public class ImapService : IDisposable
     {
         private readonly ImapClient _client;
-        private string _accountId = string.Empty;
 
         public ImapService()
         {
@@ -46,7 +46,6 @@ namespace KeeprawMail.Services
             if (_client.IsConnected)
                 await _client.DisconnectAsync(true, cancellationToken);
 
-            _accountId = account.Id;
 
             // 1. 解析代理（全局 / 继承 / 直连 / 覆盖）
             ProxyEndpoint proxy;
@@ -131,113 +130,70 @@ namespace KeeprawMail.Services
         }
 
         /// <summary>
-        /// 同步指定文件夹的邮件头
+        /// 为同步建立连接：连接 + TLS + 认证（统一代理与 TokenManager）→ 列举需要同步的文件夹 → 创建 UID 增量同步会话。
+        /// 返回的会话释放时一并断开本连接。旧的 SyncHeadersAsync（按序号取最近 50 封）与 GetBodyAsync（整封下载）已移除。
         /// </summary>
-        /// <param name="folderName">文件夹名称，默认为 Inbox</param>
-        /// <param name="limit">拉取数量限制，默认最近 50 封</param>
-        /// <returns>邮件列表</returns>
-        public async Task<List<EmailMessage>> SyncHeadersAsync(string folderName = "Inbox", int limit = 50)
+        public static async Task<AccountSyncConnection> ConnectForSyncAsync(AccountProfile account, CancellationToken cancellationToken = default)
         {
-            var results = new List<EmailMessage>();
-
-            // 获取文件夹
-            var folder = await ResolveFolderAsync(folderName);
-            await folder.OpenAsync(FolderAccess.ReadOnly);
-
-            // 计算拉取范围：从最新的开始
-            int total = folder.Count;
-            if (total == 0)
+            var service = new ImapService();
+            try
             {
-                return results;
-            }
+                await service.ConnectAsync(account, cancellationToken);
 
-            int start = Math.Max(0, total - limit);
-
-            // 批量拉取摘要信息 (Envelope + BodyStructure + Flags)
-            // SummaryItems.Envelope 包含：主题、发件人、日期、MessageId
-            // SummaryItems.BodyStructure 用于后续判断正文结构
-            var items = await folder.FetchAsync(start, -1, MessageSummaryItems.Envelope | MessageSummaryItems.InternalDate | MessageSummaryItems.UniqueId | MessageSummaryItems.Flags);
-
-            // 倒序遍历 (最新的在最前)
-            foreach (var item in items.Reverse())
-            {
-                var email = new EmailMessage
+                List<string> folders;
+                try
                 {
-                    // 使用 UniqueId 作为本地唯一标识，或者结合 MessageId
-                    Id = BuildLocalEmailId(folder.FullName, item.UniqueId),
-                    Subject = item.Envelope.Subject ?? "(No Subject)",
-                    Date = item.InternalDate ?? DateTimeOffset.Now,
-                    SenderName = item.Envelope.From.Mailboxes.FirstOrDefault()?.Name ?? "",
-                    SenderAddress = item.Envelope.From.Mailboxes.FirstOrDefault()?.Address ?? "",
-                    Snippet = "(Loading snippet...)", // 摘要通常需要下载部分正文，这里先占位
-                    IsRead = item.Flags.HasValue && item.Flags.Value.HasFlag(MessageFlags.Seen),
-                    IsStarred = item.Flags.HasValue && item.Flags.Value.HasFlag(MessageFlags.Flagged),
-                    Mailbox = folder.FullName
-                };
-                results.Add(email);
-            }
+                    folders = await service.GetFoldersToSyncAsync();
+                }
+                catch (MailSyncException) { throw; }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    throw new MailSyncException(SyncStage.ListFolders, $"列举 {account.Email} 的文件夹失败：{ex.Message}", ex);
+                }
 
-            return results;
+                var session = await service.CreateSessionAsync(cancellationToken);
+                return new AccountSyncConnection(session, folders);
+            }
+            catch
+            {
+                service.Dispose();
+                throw;
+            }
         }
 
         /// <summary>
-        /// 获取邮件正文 (HTML 或 Text)
+        /// 为按需读取正文建立会话：使用邮件所属账号自己的代理配置与 TokenManager（与同步完全相同的连接路径），
+        /// 缓存缺失时也不会绕过代理直连。返回的会话释放时一并断开连接。
         /// </summary>
-        /// <param name="folderName">文件夹名称</param>
-        /// <param name="uid">邮件 UID</param>
-        /// <returns>正文内容字符串</returns>
-        public async Task<string> GetBodyAsync(string folderName, string uid)
+        public static async Task<IImapMailSession> OpenSessionAsync(AccountProfile account, CancellationToken cancellationToken = default)
         {
-            var folder = await ResolveFolderAsync(folderName);
-            await folder.OpenAsync(FolderAccess.ReadOnly);
-
-            if (!UniqueId.TryParse(ExtractImapUid(uid), out var uniqueId))
-                return "Invalid UID";
-
-            // 简化逻辑：直接下载整封邮件并提取正文
-            // 注意：对于非常大的邮件，这可能不是最高效的，但对于 MVP 是最稳健的
-            // 获取消息
-            var message = await folder.GetMessageAsync(uniqueId);
-            
-            // 尝试获取 HTML 部分
-            var htmlPart = message.BodyParts.OfType<TextPart>().FirstOrDefault(x => x.IsHtml);
-            if (htmlPart != null)
+            var service = new ImapService();
+            try
             {
-                // 检查是否需要修复编码
-                // 很多国内银行邮件(如工行)声明为 ISO-8859-1 但实际是 GBK/GB18030
-                if (htmlPart.ContentType.Charset == null || 
-                    htmlPart.ContentType.Charset.Equals("iso-8859-1", StringComparison.OrdinalIgnoreCase) ||
-                    htmlPart.ContentType.Charset.Equals("us-ascii", StringComparison.OrdinalIgnoreCase))
-                {
-                    try 
-                    {
-                        // 尝试用 GB18030 解码
-                        // 注意：我们需要先获取原始字节
-                        using (var memory = new MemoryStream())
-                        {
-                            htmlPart.Content.DecodeTo(memory);
-                            var bytes = memory.ToArray();
-                            
-                            // 简单的启发式检测：如果包含大量高位字节，可能是 GBK
-                            if (bytes.Any(b => b > 127))
-                            {
-                                var gbk = System.Text.Encoding.GetEncoding("GB18030");
-                                return gbk.GetString(bytes);
-                            }
-                        }
-                    }
-                    catch
-                    {
-                        // 如果失败，回退到默认处理
-                    }
-                }
-                
-                return htmlPart.Text;
+                await service.ConnectAsync(account, cancellationToken);
+                return await service.CreateSessionAsync(cancellationToken);
             }
-
-            // 如果没有 HTML，尝试纯文本
-            return message.TextBody ?? "";
+            catch
+            {
+                service.Dispose();
+                throw;
+            }
         }
+
+        private async Task<IImapMailSession> CreateSessionAsync(CancellationToken cancellationToken)
+        {
+            try
+            {
+                return await MailKitImapSession.CreateAsync(_client, this, enableQResync: true, cancellationToken);
+            }
+            catch (ImapCommandException ex)
+            {
+                // 服务器宣称支持 QRESYNC 但 ENABLE 失败：退回 CONDSTORE / UID 核对策略，不影响同步正确性
+                DiagnosticLog.Write("imap", $"ENABLE QRESYNC failed ({ex.Response}), falling back");
+                return await MailKitImapSession.CreateAsync(_client, this, enableQResync: false, cancellationToken);
+            }
+        }
+
         public void Dispose()
         {
             _client.Dispose();
@@ -378,14 +334,6 @@ namespace KeeprawMail.Services
             }
 
             return await _client.GetFolderAsync(folderName);
-        }
-
-        /// <summary>
-        /// 生成本地唯一 ID，避免不同账号或文件夹的 UID 互相覆盖。
-        /// </summary>
-        private string BuildLocalEmailId(string folderName, UniqueId uid)
-        {
-            return $"{_accountId}|{folderName}|{uid}";
         }
 
         /// <summary>

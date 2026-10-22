@@ -217,6 +217,12 @@ namespace KeeprawMail.Data
 
         private EmailStore Emails => new(ConnectionString);
 
+        /// <summary>邮件存储（同步引擎与按需正文下载共用，与列表读取同一张 Emails 表）。</summary>
+        public EmailStore CreateEmailStore() => new(ConnectionString);
+
+        /// <summary>每账号、每文件夹的同步状态存储。</summary>
+        public MailboxSyncStateStore CreateSyncStateStore() => new(ConnectionString);
+
         /// <summary>
         /// 批量保存邮件（UPSERT，FTS 由触发器同步）。
         /// </summary>
@@ -234,6 +240,7 @@ namespace KeeprawMail.Data
                 Mailbox = e.Mailbox ?? "Inbox",
                 AccountId = e.AccountId ?? "",
                 IsStarred = e.IsStarred,
+                ImapUid = e.ImapUid,
             }).ToList());
 
         /// <summary>
@@ -255,6 +262,7 @@ namespace KeeprawMail.Data
                 Mailbox = r.Mailbox,
                 AccountId = r.AccountId,
                 IsStarred = r.IsStarred,
+                ImapUid = r.ImapUid,
             }).ToList();
         }
 
@@ -422,6 +430,9 @@ namespace KeeprawMail.Data
             command.Transaction = transaction;
             
             command.CommandText = "DELETE FROM Emails";
+            await command.ExecuteNonQueryAsync();
+
+            command.CommandText = "DELETE FROM MailboxSyncState";
             await command.ExecuteNonQueryAsync();
             
             command.CommandText = "DELETE FROM Accounts";

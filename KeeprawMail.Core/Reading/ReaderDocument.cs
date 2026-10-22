@@ -69,7 +69,7 @@ public static partial class ReaderDocument
     <div class='error'>
         <p><b>{Encode(title)}</b></p>
         <p>{Encode(detail)}</p>
-        <p class='hint'>可点击工具栏的“同步”重新下载正文，然后关闭此标签页再次打开邮件重试。</p>
+        <p class='hint'>点击“重试”会重新从服务器下载正文。</p>
     </div>");
 
     private static string Page(string inner) => $@"<!DOCTYPE html>
@@ -101,7 +101,7 @@ public static partial class ReaderDocument
     public static async Task<BodyLoadResult> LoadBodyAsync(string? path, AppFileCache bodyCache, CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(path))
-            return BodyLoadResult.Fail("这封邮件的正文尚未下载（同步时下载失败或尚未同步）。");
+            return BodyLoadResult.Fail("这封邮件的正文尚未下载（打开邮件时按需下载）。");
         if (!bodyCache.IsInside(path))
             return BodyLoadResult.Fail("正文文件路径不在应用缓存目录内，已拒绝读取。");
         if (!File.Exists(path))
