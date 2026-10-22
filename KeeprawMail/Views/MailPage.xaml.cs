@@ -456,7 +456,7 @@ namespace KeeprawMail.Views
                 }
 
                 // 构建引用原文
-                var quotedBody = $"<br><br><br><hr><p><b>原始邮件</b></p><p><b>发件人:</b> {email.SenderName} &lt;{email.SenderAddress}&gt;</p><p><b>日期:</b> {email.Date}</p><p><b>主题:</b> {email.Subject}</p><br>{body}";
+                var quotedBody = $"<br><br><br><hr><p><b>原始邮件</b></p><p><b>发件人:</b> {email.SenderName} &lt;{email.SenderAddress}&gt;</p><p><b>日期:</b> {email.FullDateTooltip}</p><p><b>主题:</b> {email.Subject}</p><br>{body}";
                 
                 var subject = email.Subject.StartsWith("Re:") ? email.Subject : "Re: " + email.Subject;
                 
@@ -484,7 +484,7 @@ namespace KeeprawMail.Views
                 }
 
                 // 构建转发内容
-                var forwardedBody = $"<br><br><br><hr><p><b>转发邮件</b></p><p><b>发件人:</b> {email.SenderName} &lt;{email.SenderAddress}&gt;</p><p><b>日期:</b> {email.Date}</p><p><b>主题:</b> {email.Subject}</p><br>{body}";
+                var forwardedBody = $"<br><br><br><hr><p><b>转发邮件</b></p><p><b>发件人:</b> {email.SenderName} &lt;{email.SenderAddress}&gt;</p><p><b>日期:</b> {email.FullDateTooltip}</p><p><b>主题:</b> {email.Subject}</p><br>{body}";
                 
                 var subject = email.Subject.StartsWith("Fwd:") ? email.Subject : "Fwd: " + email.Subject;
                 

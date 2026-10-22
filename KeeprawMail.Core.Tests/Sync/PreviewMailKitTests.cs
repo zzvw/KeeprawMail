@@ -479,17 +479,29 @@ public partial class PreviewMailKitTests : IAsyncLifetime
         var service = Previews();
         await Task.WhenAll(service.RequestAsync("acc"), service.RequestAsync("acc2"));
 
-        async Task<string> Snip(string account, string mailbox) => Assert.Single(await _db.MailboxAsync(account, mailbox)).Snippet;
-        Assert.Equal("alpha acc inbox", await Snip("acc", "INBOX"));
-        Assert.Equal("gamma acc archive", await Snip("acc", "Archive"));
-        Assert.Equal("beta acc2 archive", await Snip("acc2", "Archive"));
-        Assert.Equal("delta acc2 inbox", await Snip("acc2", "INBOX"));
-        Assert.All(await _db.Emails.GetRecentAsync(), r => Assert.Equal(1u, r.ImapUid)); // 四封邮件 UID 都是 1
-        // 每个账号只用自己的连接（各自的服务器上：同步 2 个文件夹 + 预览 2 个文件夹）
-        Assert.Equal(4, _server.Commands.Count(c => c.StartsWith("EXAMINE")));
-        Assert.Equal(4, serverB.Commands.Count(c => c.StartsWith("EXAMINE")));
-        Assert.Equal(2, PartialCommands(_server).Count);
-        Assert.Equal(2, PartialCommands(serverB).Count);
+        // 默认首页（统一收件箱）只显示各账号 INBOX，预览候选与首页同一范围：Archive 中的邮件不预览（仍为 Pending，数据保留）
+        async Task<StoredEmail> Row(string account, string mailbox) => Assert.Single(await _db.MailboxAsync(account, mailbox));
+        Assert.Equal("alpha acc inbox", (await Row("acc", "INBOX")).Snippet);
+        Assert.Equal("delta acc2 inbox", (await Row("acc2", "INBOX")).Snippet);
+        Assert.Equal(PreviewState.Pending, (await Row("acc", "Archive")).PreviewState);
+        Assert.Equal(PreviewState.Pending, (await Row("acc2", "Archive")).PreviewState);
+        var recent = await _db.Emails.GetRecentAsync();
+        Assert.Equal(2, recent.Count);
+        Assert.All(recent, r => Assert.Equal(1u, r.ImapUid)); // 两个账号 INBOX 的邮件 UID 都是 1
+        Assert.All(recent, r => Assert.Equal("INBOX", r.Mailbox));
+        // 每个账号只用自己的连接（各自的服务器上：同步 2 个文件夹 + 预览 1 个文件夹）
+        Assert.Equal(3, _server.Commands.Count(c => c.StartsWith("EXAMINE")));
+        Assert.Equal(3, serverB.Commands.Count(c => c.StartsWith("EXAMINE")));
+        Assert.Equal(1, PartialCommands(_server).Count);
+        Assert.Equal(1, PartialCommands(serverB).Count);
+
+        // 同一 UID、不同账号、不同文件夹：预览结果按 (账号, 文件夹, UID) 写入，不会串号（未来文件夹视图为 Archive 写入预览时同样适用）
+        await _db.Emails.ApplyPreviewResultsAsync("acc", "Archive", null, new[] { new PreviewResultUpdate(1, PreviewState.Ready, "gamma acc archive", null) });
+        await _db.Emails.ApplyPreviewResultsAsync("acc2", "Archive", null, new[] { new PreviewResultUpdate(1, PreviewState.Ready, "beta acc2 archive", null) });
+        Assert.Equal("gamma acc archive", (await Row("acc", "Archive")).Snippet);
+        Assert.Equal("beta acc2 archive", (await Row("acc2", "Archive")).Snippet);
+        Assert.Equal("alpha acc inbox", (await Row("acc", "INBOX")).Snippet);
+        Assert.Equal("delta acc2 inbox", (await Row("acc2", "INBOX")).Snippet);
     }
 
     // ======================================================================== 打开正文仍按需；预览与正文互不调用
