@@ -53,7 +53,8 @@ public class PreviewMetricsTests : IAsyncLifetime
         };
         if (i % 5 == 0)
             builder.Attachments.Add($"report{i}.pdf", Enumerable.Repeat((byte)(i % 251), 200_000).ToArray(), new ContentType("application", "pdf"));
-        var m = new MimeMessage { Subject = $"Message {i}", Date = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero).AddMinutes(i), Body = builder.ToMessageBody() };
+        // 固定 Message-ID：MimeKit 自动生成的 Message-ID 含本机主机名，会让元数据字节数随运行环境变化
+        var m = new MimeMessage { Subject = $"Message {i}", Date = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero).AddMinutes(i), Body = builder.ToMessageBody(), MessageId = $"metrics{i}@example.test" };
         m.From.Add(new MailboxAddress($"Sender {i}", $"s{i}@example.test"));
         return m;
     }
