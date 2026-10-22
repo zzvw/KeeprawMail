@@ -12,7 +12,8 @@
 | `IImapMailSession` / `MailKitImapSession` | `Core/Imap/` | 协议边界（MailKit 4.18.1 实现，测试可替换） |
 | `BodyPartSelector` / `BodyTextDecoder` / `SnippetBuilder` | `Core/Imap/MimeBodyText.cs` | 正文 MIME 部分选择、字符集解码、摘要 |
 | `OnDemandBodyLoader` | `Core/Reading/OnDemandBodyLoader.cs` | 打开邮件时按需下载正文、合并并发请求 |
-| `PreviewPartSelector` / `TruncatedTransferDecoder` / `PreviewTextExtractor` | `Core/Imap/PreviewText.cs` | PR3：预览部分选择（优先 text/plain）、截断内容的传输解码与摘要提取 |
+| `PreviewPartSelector` / `TruncatedTransferDecoder` / `PreviewTextExtractor` / `PreviewDiagnostics` | `Core/Imap/PreviewText.cs` | PR3：预览部分选择（text/plain 优先，保留同一 alternative 的 html）、截断内容的传输解码、摘要可用性判断、脱敏诊断 |
+| `HtmlTextStripper` | `Core/Imap/MimeBodyText.cs` | PR3：按 HTML 解析规则的有状态文本提取（不依赖 `</head>`，style / 注释 / 条件注释跨越下载边界） |
 | `IImapMailSession.FetchPreviewsAsync` | `Core/Imap/MailKitImapSession.cs` | PR3：BODYSTRUCTURE 批量 + 有界部分下载 `BODY.PEEK[section]<offset.count>` |
 | `EmailStore`（预览部分） | `Core/Storage/EmailStore.Preview.cs` | PR3：预览候选（与列表同一查询）与预览结果写入 |
 | `MailPreviewService` | `Core/Preview/MailPreviewService.cs` | PR3：后台预览任务（按账号合并、复用会话、可取消、退避） |
@@ -111,60 +112,103 @@
 
 `IImapMailSession.FetchPreviewsAsync(mailbox, uids)`（`MailKitImapSession` 实现）对一批邮件：
 
-1. 一条 `UID FETCH <set> (UID BODYSTRUCTURE)` 批量取得结构（不含任何正文内容）；
+1. 一条 `UID FETCH <set> (UID BODYSTRUCTURE)` 批量取得结构（不含任何正文内容）。服务器对整批回答 `NO`（Gmail 在集合中某一封无法取出时会对整条 FETCH 回答 `NO Some messages could not be FETCHed`，MailKit 随之丢弃整批结果）且连接仍可用时，**逐封重试 BODYSTRUCTURE**，只让被拒绝的那一封失败；
 2. 按结构选择正文部分（9.2），对每封邮件发出 `UID FETCH <uid> (BODY.PEEK[<section>]<0.4096>)`；
-3. 解码后没有有意义的文本（没有任何字母或数字）时，至多再发一次请求：同一部分续读 `<4096.4096>`，或（纯文本部分已完整读完但为空时）读同一 `multipart/alternative` 中的 html 部分 `<0.4096>`；
-4. 每封邮件合计不超过 **8 KiB（8192 字节）** 传输内容、不超过 2 次部分下载请求（`PreviewFetchLimits`）；8 KiB 内仍没有文本 ⇒ `NoText`，**绝不为了摘要下载整封邮件或完整正文**；没有 BODYSTRUCTURE 时同样不下载、记为 `NoText`；
-5. 文件夹以 `EXAMINE` 打开、使用 `BODY.PEEK`，不改变服务器上的 `\Seen`；实际收到的字节数（MailKit 返回的流长度）逐封统计并返回。
+3. 没有“可用”文本时至多再发一次请求（9.2 的回退策略），请求量为“8 KiB 减去已收到的字节”；
+4. 每封邮件合计不超过 **8 KiB（8192 字节）** 传输内容、不超过 2 次部分下载请求（`PreviewFetchLimits`）；**绝不为了摘要下载整封邮件、完整正文或附件**；
+5. 文件夹以 `EXAMINE` 打开、使用 `BODY.PEEK`，不改变服务器上的 `\Seen`；实际收到的字节数（MailKit 返回的流长度）逐封统计并返回；
+6. 单封失败的隔离：`NO` / `BAD` ⇒ 只有这一封 Failed；本地解析 / 解码异常且连接仍可用 ⇒ 只有这一封 Failed（`local_error`）；断线、`ImapProtocolException`、超时等连接级错误 ⇒ 本封与本批之后的邮件 Failed（`connection`），已得到的结果照常写入。
 
 **MailKit 4.18.1 `GetStreamAsync` 的实测结论**（`PreviewMailKitTests.MailKit_GetStreamAsync_PartialFetch_SemanticsVerified`，以服务器收到的命令与发送的字节为准）：
 
 - `IMailFolder.GetStreamAsync(UniqueId, string section, int offset, int count)` 发出 `UID FETCH uid (BODY.PEEK[section]<offset.count>)`，是服务器端的有界部分下载，不是下载完整正文后在客户端截断；
 - `offset` / `count` 是该 MIME 部分**传输编码后内容**中的字节位置（RFC 3501 §6.4.5）；返回的流是服务器发送的原始字节，**MailKit 不做 base64 / quoted-printable / 字符集解码**；offset 超出末尾时返回空流；
 - `GetStreamAsync(UniqueId, BodyPart, offset, count)` 直接使用 `BodyPart.PartSpecifier`。单部分（非 multipart）邮件的根部分 `PartSpecifier` 是空字符串，这个重载会变成 `BODY.PEEK[]<0.4096>`——整封邮件从邮件头开始的前 4 KiB（邮件头较大时一个正文字节都拿不到）。因此实现改用字符串重载，根部分使用 `TEXT`，其余使用部分编号（如 `1`、`1.1`、`1.1.1`）。
+- MailKit 在服务器没有返回所请求的 section（例如 UID 已不存在）时抛出 `MessageNotFoundException`；`NO` / `BAD` 抛出 `ImapCommandException`（不断开连接）；响应无法解析时抛出 `ImapProtocolException`（并断开连接）。
 - 不规范的服务器若忽略 `<offset.count>` 发送完整内容，MailKit 会照收（协议层无法阻止）；实现只解码请求的前 count 字节，并如实统计实际收到的字节数。
 
-### 9.2 MIME 选择与解码
+### 9.2 MIME 选择、回退策略与解码
 
-- 结构选择（`PreviewPartSelector`）：优先 `text/plain`，没有时 `text/html`；递归 `multipart/alternative`（选纯文本，多个候选取最后一个）、`multipart/mixed` / `related` / `signed` 等（取第一个能提供正文的子部分，之后的部分视为附件 / 内嵌资源）；`Content-Disposition: attachment` 的文本、`message/rfc822` 附带的邮件、`text/calendar` 等其它文本类型、二进制部分一律不作为正文。
-- 截断安全的传输解码（`TruncatedTransferDecoder`，不依赖任何假设内容完整的 API）：base64 只解码完整的 4 字符组（末尾不完整的组丢弃，忽略换行，支持中途填充）；quoted-printable 处理 `=XX` 与软换行，末尾不完整的 `=`、`=X`、`=\r` 丢弃，非法转义原样保留；7bit / 8bit / binary 原样；未知编码 ⇒ `NoText`。
-- 截断安全的字符集解码（`BodyTextDecoder.DecodePrefix`）：声明字符集（UTF-8、GBK / GB2312 按代码页 936、GB18030 含四字节序列……）用解码器“不刷新”解码，末尾不完整的多字节字符不会变成替换字符；未声明或声明为 ISO-8859-1 时，先去掉末尾不完整序列再做严格 UTF-8 / GBK 探测（与打开正文的规则一致），避免被截断的 UTF-8 被误判为 Latin-1。
-- 摘要（`SnippetBuilder.FromBody(text, isHtml, truncated)`，与打开正文共用）：HTML 去掉 `head` / `style` / `script` / `title` 与注释（包括 Outlook 条件注释），截断时从未闭合的这些块处截止、去掉末尾未闭合的标签与不完整的实体，再去标签、解码实体；去掉零宽字符、`&#847;` 等营销邮件预览填充与控制字符，压缩空白；上限从 200 提高到 **280 字符**（不拆开代理对）。结果只有纯文本，界面用 `TextBlock` 显示，从不把 HTML 绑定到 XAML，列表行中没有 WebView2。
+**结构选择**（`PreviewPartSelector`，只看 BODYSTRUCTURE）：在同一个“正文位置”（同一个 `multipart/alternative`，或单独的一个文本部分）同时记下 `text/plain` 与 `text/html`；`multipart/mixed` / `related` / `signed` 等取第一个能提供正文的子部分（之后的部分视为附件 / 内嵌资源）；`Content-Disposition: attachment` 的文本、`message/rfc822` 附带的邮件、`text/calendar` 等其它文本类型、二进制部分一律不作为正文。结构中**确实没有**文本正文部分时才是 NoText（`no_text_part`），且不发任何部分下载。
 
-### 9.3 预览状态与数据库（结构版本 4）
+**回退策略**（每封 ≤ 2 次请求、≤ 8 KiB）：
 
-`Emails` 新增三列（`MailStoreSchema.EnsureAsync` 中按列存在检查幂等添加，同一事务中把 `user_version` 从 3 升到 4）：
+| 步骤 | 做法 |
+|---|---|
+| 第 1 次 | 有非空 `text/plain`（BODYSTRUCTURE 报告 0 字节的跳过）⇒ 读它的 `<0.4096>`；否则读 `text/html` 的 `<0.4096>` |
+| 结束条件 | 得到“可用”摘要（`PreviewTextExtractor.IsUseful`：去掉 URL、“在浏览器中查看 / View this email in your browser / Click here / 退订”等套话与少量功能词后仍有文字）即 Ready |
+| 第 2 次（纯文本无用且同一 alternative 有 html） | 改读 html 的 `<0.(8192−已收字节)>`——空白 / 只有链接 / 只有套话的纯文本版本通常只有几十字节，因此 html 可得到约 8 KiB，足以越过常见的 5–7 KiB CSS 头部 |
+| 第 2 次（其它情况） | 同一部分从第一次结束处续读 `<已收字节.(8192−已收字节)>`，两段**拼接后整体**做传输解码、字符集解码与 HTML 扫描（跨越两次下载边界的 `<style>`、base64 组、QP 转义、多字节字符都能正确处理） |
+| 判定 | 有可用摘要 ⇒ Ready；所有文本部分都已完整读完 ⇒ 有文字则 Ready（邮件本身只有这些字）、否则 NoText（`empty_text`）；仍有未读完的文本 ⇒ **Unavailable（`beyond_budget`）**，不是 NoText |
 
-| 列 | 类型 | 说明 |
-|---|---|---|
-| `PreviewState` | INTEGER NOT NULL DEFAULT 0 | 0 Pending、1 Ready、2 NoText、3 Failed（不再用空字符串表示状态） |
-| `PreviewAttempts` | INTEGER NOT NULL DEFAULT 0 | 连续失败次数 |
-| `PreviewNextRetryAt` | TEXT | Failed 的下次重试时间（UTC ISO 8601，文本比较即时间比较） |
+传输编码名称容忍常见的非标准写法（`8-bit`、`7bits`、`base-64`、`quoted printable`、`qp`、大小写 / 引号 / 空白）；确实未知的编码（如 `x-uuencode`）不下载：另一个版本可用时改用它，否则 Unavailable（`unknown_cte`）。服务器不提供 BODYSTRUCTURE 时同样不下载，记为 Unavailable（`no_structure`，因为无法知道有没有文本）。
 
-- 回填只在从 < 4 升级时执行一次，只改 `PreviewState`（不改 `Snippet`，FTS 不受影响）：已有摘要 ⇒ Ready；正文已缓存但摘要为空 ⇒ NoText；其余 ⇒ Pending。不删除、不改写任何账号、邮件、摘要、正文缓存、凭据或同步状态。
-- 预览写入（`ApplyPreviewResultsAsync`）只更新 `Snippet` 与三列预览状态：不清空 `BodyLocalPath`，不改已读 / 星标 / 主题 / 发件人 / UID，不读写 `MailboxSyncState` 的游标；只更新 Pending / Failed 且未缓存正文的行；写入前确认本次 `EXAMINE` 的 `UIDVALIDITY` 与已保存的一致（防止文件夹重建后把摘要写到另一封邮件上）。FTS5 由 `Emails_au`（`UPDATE OF Snippet`）触发器同步。
+**截断安全的传输解码**（`TruncatedTransferDecoder`，不依赖任何假设内容完整的 API）：base64 只解码完整的 4 字符组（末尾不完整的组丢弃，忽略换行，支持中途填充）；quoted-printable 处理 `=XX` 与软换行，末尾不完整的 `=`、`=X`、`=\r` 丢弃，非法转义原样保留；7bit / 8bit / binary 原样。
+
+**截断安全的字符集解码**（`BodyTextDecoder.DecodePrefix`）：声明字符集（UTF-8、GBK / GB2312 按代码页 936、GB18030 含四字节序列……）用解码器“不刷新”解码，末尾不完整的多字节字符不会变成替换字符；未声明或声明为 ISO-8859-1 时，先去掉末尾不完整序列再做严格 UTF-8 / GBK 探测（与打开正文的规则一致）。
+
+**HTML 文本提取**（`HtmlTextStripper` + `SnippetBuilder.FromBody(text, isHtml, truncated)`，与打开正文、本地缓存重算共用）：按 HTML 解析规则做有状态扫描，取代旧的正则：
+
+- `style` / `script` / `title` 等原始文本元素一直跳到对应结束标记，中间的 `<!--`、`<p>`、`</div>`（如 CSS `content:"…"`）不会误判；
+- **不依赖 `</head>`**：head 中的 CSS 作为 style 跳过；head 中出现非 head 元素（或 `<body>`、非空白文本）时按 HTML 规则隐式结束 head。旧实现在截断内容中遇到“未闭合的 `<head`”会从开头截断，省略 `</head>` 的模板无论读多少字节都是 NoText；
+- 注释（含 `<!--[if mso]> … <![endif]-->`、空注释 `<!-->`）、`<!DOCTYPE>`、`<![if !mso]>` / `<![endif]>`、`<?xml?>`、CDATA 跳过；下层显示的条件注释（`<!--[if !mso]><!--> … <!--<![endif]-->`）中的内容照常显示；
+- 属性值中的 `>`（只认紧跟 `=` 的引号，与浏览器一致）不会提前结束标签；
+- 遇到未闭合的注释 / 原始文本元素 / 标签（截断处）即停止，绝不输出 CSS、脚本或标记；末尾不完整的实体丢弃；
+- `display:none` 的预览文字（preheader）与其它邮件客户端一样作为摘要开头保留；其后的 `&zwnj;&nbsp;`、`&#847;`、`&#8199;`、零宽字符、BOM 等填充被去除并压缩空白；上限 **280 字符**（不拆开代理对）。结果只有纯文本，界面用 `TextBlock` 显示，列表行中没有 WebView2。
+
+### 9.3 预览状态与数据库（结构版本 4 → 5）
+
+`Emails` 的预览列（`MailStoreSchema.EnsureAsync` 中按列存在检查幂等添加；每次升级与 `user_version` 在**同一事务**中提交）：
+
+| 列 | 类型 | 版本 | 说明 |
+|---|---|---|---|
+| `PreviewState` | INTEGER NOT NULL DEFAULT 0 | 4 | 0 Pending、1 Ready、2 NoText、3 Failed、**4 Unavailable**（v5 新增取值） |
+| `PreviewAttempts` | INTEGER NOT NULL DEFAULT 0 | 4 | 连续失败次数 |
+| `PreviewNextRetryAt` | TEXT | 4 | Failed 的下次重试时间（UTC ISO 8601，文本比较即时间比较） |
+| `PreviewAlgo` | INTEGER NOT NULL DEFAULT 0 | 5 | 产生当前状态的预览算法版本：0 = v5 之前写入（PR3 第一版算法 / v4 回填），1 = 当前算法（`PreviewAlgorithm.Current`） |
+| `PreviewDiag` | TEXT | 5 | 脱敏诊断（9.7），Ready 时为 NULL |
+
+**状态机**
+
+| 状态 | 含义 | 是否再取 | 列表显示 |
+|---|---|---|---|
+| Pending | 尚未生成 | 是（在列表前 100 封内时） | 正在加载预览… |
+| Ready | 有摘要 | 否 | 摘要文本 |
+| NoText | **确实没有文本**：结构中没有文本正文部分（`no_text_part`），或文本部分已完整读完但没有文字（`empty_text`） | 否（当前算法下） | 无文本预览 |
+| Unavailable | **有文本部分，但预算内没有可用摘要**（`beyond_budget`、`unknown_cte`、`no_structure`、`cache_missing`） | 否（结果不会变）；算法升级时可凭 `PreviewAlgo` 有选择地重试；打开邮件后由完整正文生成摘要 | 打开邮件查看内容 |
+| Failed | 本次失败（`uid_missing`、`server_no`、`server_no_structure`、`connection`、`local_error`、`structure_fetch`、`session`、`not_returned`） | 是：5 分钟 → 30 分钟 → 2 小时 → 12 小时退避 | 预览暂不可用 |
+
+- v4 回填（只在从 < 4 升级时执行一次，只改 `PreviewState`）：已有摘要 ⇒ Ready；正文已缓存但摘要为空 ⇒ NoText；其余 ⇒ Pending。
+- **v5 一次性重新尝试**（只在从 < 5 升级时执行一次，与 `user_version = 5` 同一事务，只改预览列，不改 `Snippet` / `BodyLocalPath` / 已读 / 星标 / UID / 同步状态，FTS 不受影响）：
+  1. `PreviewState = 2 AND PreviewAlgo < 1` 且**没有正文缓存**、摘要为空的行 ⇒ Pending（下次预览用新算法重新判定一次；结果写入 `PreviewAlgo = 1`，之后不再重复）；
+  2. `PreviewState = 3 AND PreviewAlgo < 1` 的行 ⇒ 清除退避（`PreviewAttempts = 0`、`PreviewNextRetryAt = NULL`），下次预览立即重试一次；
+  3. **有正文缓存**的旧 NoText（多为 v4 回填）保持原状，由预览任务从本地缓存**零网络**重算（9.4），写入 `PreviewAlgo = 1`，每行只做一次。
+- 预览写入（`ApplyPreviewResultsAsync`）只更新 `Snippet` 与预览列：不清空 `BodyLocalPath`，不改已读 / 星标 / 主题 / 发件人 / UID，不读写 `MailboxSyncState`；只更新 Pending / Failed 且未缓存正文的行；写入前确认本次 `EXAMINE` 的 `UIDVALIDITY` 与已保存的一致。Ready / NoText / Unavailable 写入当前算法版本。FTS5 由 `Emails_au`（`UPDATE OF Snippet`）触发器同步。
 - 同步：新邮件以 Pending 插入；元数据 UPSERT 不触碰预览列；旧版映射无法确认而清除摘要时，预览状态一并重置为 Pending。
-- 打开正文（`UpdateBodyAsync`）：完整正文生成的摘要覆盖预览摘要并设为 Ready；完整正文没有文本时保留已有预览摘要（没有时为 NoText）。
-- 状态机：Ready 与 NoText 永不再取；Failed 按 5 分钟 → 30 分钟 → 2 小时 → 12 小时退避；取消时未处理的邮件保持原状态（Pending），下次继续。
+- 打开正文（`UpdateBodyAsync`）：完整正文生成的摘要覆盖预览摘要并设为 Ready；完整正文没有文本时保留已有预览摘要（没有时为 NoText，`PreviewDiag = r=body_empty`）；写入当前算法版本。
+- 取消时未处理的邮件保持原状态（Pending），下次继续。
 
 ### 9.4 后台预览任务（`MailPreviewService`）
 
 - 候选与列表使用同一查询：每个账号按 `Date` 倒序的前 100 封（`EmailStore.DefaultPerAccountLimit`，`PARTITION BY AccountId`），只取 Pending 或已到重试时间的 Failed、`ImapUid` 已知、未缓存正文的邮件；不是整个邮箱历史。**没有候选时不建立任何连接。**
-- 触发：每个账号的元数据同步完成后（同步报告不是 Failed 时）安排一次，不等待预览，因此不阻塞、不影响同步完成与同步结果；应用启动后第一次加载列表时，为列表中仍是 Pending / Failed 的邮件所在账号安排一次。
-- 每个账号一个会话（`ImapService.OpenSessionAsync`：该账号自己的代理与 TokenManager，与同步、打开正文同一连接路径），按文件夹分组复用，不按邮件重连或重新认证；文件夹按其中最新邮件排序、组内按时间倒序，新到的邮件优先；每 20 封一批（一条 BODYSTRUCTURE + 逐封部分下载），每批结果立即写库并通知界面。
-- 同一账号重复请求合并：运行中再次请求只会在本轮结束后再跑一轮（覆盖刚同步到的新邮件）；不同账号可并行。
-- 失败隔离：单封邮件的 `NO` 只把该封记为 Failed；断线等连接级错误时已得到的结果照常写入，其余记为 Failed（退避）；会话建立失败（离线、需要重新授权）时候选记为 Failed。预览任何失败都不会让成功的同步变成失败，也不推进或修改 UID 游标。
-- 界面：`PreviewsUpdated` 事件经 UI 线程的 `SynchronizationContext` 更新 `EmailMessage.Snippet` / `PreviewState`，列表立即刷新、无需打开邮件；列表重载与预览写入交错时，用最近收到的预览结果补齐新列表项。
+- **本地缓存重算**（构造时传入正文缓存目录时；应用中传入 `AppPaths.BodyCache`）：每轮开始先处理该账号“有正文缓存、`PreviewState = 2`、`PreviewAlgo < 1`”的行（不受前 100 封限制，每轮最多 500 封），只读应用缓存目录内的文件（最多 2 MB），用当前摘要算法生成摘要：有文字 ⇒ Ready；缓存内容是打开正文时写入的“没有可显示的文本正文…”说明 ⇒ NoText（`no_text_part`）；HTML / 文本中确实没有文字 ⇒ NoText（`empty_text`）；缓存文件丢失或不可读 ⇒ Unavailable（`cache_missing`，打开邮件时会重新下载）。零网络，结果写入 `PreviewAlgo = 1`，因此只做一次。
+- 触发：每个账号的元数据同步完成后（同步报告不是 Failed 时）安排一次，不等待预览；应用启动后第一次加载列表时为列表中的**每个账号**安排一次（没有候选的账号不建立连接，只做上面的本地重算）。
+- 每个账号一个会话（`ImapService.OpenSessionAsync`：该账号自己的代理与 TokenManager），按文件夹分组复用，不按邮件重连或重新认证；文件夹按其中最新邮件排序、组内按时间倒序；每 20 封一批，每批结果立即写库并通知界面。
+- 同一账号重复请求合并：运行中再次请求只会在本轮结束后再跑一轮；不同账号可并行。
+- 失败隔离：见 9.1 第 6 条；整批 BODYSTRUCTURE 失败（连接级）时本批与之后的批次记为 Failed（`structure_fetch`）；会话建立失败（离线、需要重新授权）时候选记为 Failed（`session`）。预览任何失败都不会让成功的同步变成失败，也不推进或修改 UID 游标。
+- `Missing`（UID 已不在该文件夹）记为 Failed（`uid_missing`）并退避，不删除任何本地记录；本地陈旧记录由同步的 UID 核对删除（Gmail 每 6 小时一次，见第 5 节）。
+- 界面：`PreviewsUpdated` 事件经 UI 线程的 `SynchronizationContext` 更新 `EmailMessage.Snippet` / `PreviewState`；列表重载与预览写入交错时，用最近收到的预览结果补齐新列表项。
 
 ### 9.5 列表显示
 
-`MailPage.xaml` 摘要 `TextBlock` 绑定 `EmailMessage.SnippetDisplay`（`MaxLines="3"`、`TextWrapping="Wrap"`、`TextTrimming="CharacterEllipsis"`），三栏布局、星标、时间、发件人、主题不变：
+`MailPage.xaml` 摘要 `TextBlock` 绑定 `EmailMessage.SnippetDisplay`（`MaxLines="3"`、`TextWrapping="Wrap"`、`TextTrimming="CharacterEllipsis"`），三栏布局、星标、时间、发件人、主题不变；提示文本只用于显示，不写数据库、不进 FTS：
 
 | 状态 | 显示 |
 |---|---|
 | Ready（或打开正文后已有摘要） | 摘要文本 |
 | Pending | 正在加载预览…（淡色） |
 | NoText | 无文本预览（淡色） |
+| Unavailable | 打开邮件查看内容（淡色） |
 | Failed | 预览暂不可用（淡色） |
 
 ### 9.6 实测请求数（`PreviewMetricsTests.Pr3_PreviewRequestCounts_Measured`）
@@ -180,3 +224,51 @@
 | 新增 10 封后同步 / 随后预览 | 4 / 12 | 9,709 / 45,032 | 只预览 UID 501–510（部分下载 10） |
 | 打开未缓存的带附件邮件 | 3 | 1,174 | 只有 html 正文部分（MIME 头 + 内容），预览请求 0，附件 0 |
 | 再次打开（已缓存）/ 随后预览 | 0 / 0 | 0 / 0 | |
+| 真实结构混合 20 封（账号 rw）/ 随后再预览 | 31 / 0 | 106,083 / 0 | EXAMINE 1 + BODYSTRUCTURE 1 + 部分下载 29（AA 类 5×2、GitHub 类 5×1、Tiptrans 类 5×2、只有附件 3×0、CSS 头部 > 8 KiB 2×2）；部分内容 99,470 字节，单封最多 8,192；Ready 15 / NoText 3 / Unavailable 2 / Failed 0 |
+
+第 1–6 行在本次修复前后完全相同（普通邮件纯文本可用时仍是每封一次 4 KiB 请求）。
+
+### 9.7 预览诊断（脱敏）
+
+NoText、Unavailable、Failed 都记录诊断，写入 `Emails.PreviewDiag`，并在 `diagnostics.log` 中写一行 `[preview] preview-diag state=<状态> folder=<文件夹> r=… t=… q=… b=… [x=…]`：
+
+```
+r=<原因代码>;t=<MIME 类型,…>;q=<部分下载请求数>;b=<收到的字节数>[;x=<异常类型名>][;src=cache]
+例：r=beyond_budget;t=text/plain,text/html;q=2;b=8192
+    r=no_text_part;t=application/pdf;q=0;b=0
+    r=uid_missing;q=0;b=0
+    r=server_no;t=text/plain;q=1;b=0;x=ImapCommandException
+```
+
+只包含原因代码、MIME 类型（只保留 type/subtype 的合法字符，最多 4 个）、请求数、字节数与异常类型名；**不包含正文、主题、地址、凭据或服务器返回的文字**（`PreviewDiagnostics.Format` 会去掉 token 之外的字符）。文件夹不写入该列（同一行的 `Mailbox` 已是文件夹），只出现在日志行中。每轮的汇总行另有 `unavailable=`、`cacheRecomputed=`、`maxPerMessage=`。
+
+### 9.8 真实邮件中的误判：根因（Windows 实测反馈）
+
+| 现象 | 典型结构 | 根因（旧实现） | 修复 |
+|---|---|---|---|
+| American Airlines 等交易 / 营销邮件“无文本预览” | `multipart/alternative`：几乎为空、只有空白 / 链接 / “View in browser”的 `text/plain` + QP 编码的 `text/html`，head 中 5–8 KiB 的响应式 CSS、Outlook 条件注释、`display:none` 预览文字 + `&zwnj;&nbsp;` 填充 | ① 纯文本已完整读完却无文字时只给 html **4 KiB**，4 KiB 内全是 head ⇒ 永久 NoText；② 纯文本只有 URL / 套话也算“有意义”，直接拿链接当摘要或不再看 html；③ 纯文本前 4 KiB 是填充时继续读填充而不是 html；④ “预算内没读到文字”与“没有文本”都记为 NoText，且永不重试 | 剩余预算（约 8 KiB）从头读 html；`IsUseful` 识别链接 / 套话；Unavailable 与 NoText 分开；v5 一次性重新尝试 |
+| Tiptrans 等单部分 HTML“无文本预览” | 单部分 `text/html`（base64 / QP），大段内联 CSS；部分模板省略 `</head>` | ⑤ 截断内容中“未闭合的 `<head`”从开头截断：省略 `</head>` 时无论读多少都是空；⑥ CSS 超过 8 KiB 时一律 NoText | 有状态 HTML 扫描，不依赖 `</head>`；CSS 超过 8 KiB 时如实记为 Unavailable（见 9.9） |
+| 部分 GitHub 通知“预览暂不可用” | `multipart/alternative`：QP / 7bit 的 UTF-8 `text/plain` + `text/html`（结构本身没有问题，纯文本第一次 4 KiB 即可得到摘要，见 `GitHubNotificationLike_AlternativeQpUtf8_PlainReadyInOneRequest`） | ⑦ 同步之后、预览之前邮件在服务器上被归档 / 删除 / 移走（通知类邮件常被批量处理），本地记录要等 UID 核对（Gmail 6 小时）才清除；BODYSTRUCTURE 对该 UID 没有数据 ⇒ `Missing` ⇒ 显示“预览暂不可用”且无任何诊断；⑧ 服务器对整批 BODYSTRUCTURE 回答 `NO`（Gmail 的 “Some messages could not be FETCHed”）时，本批与之后**所有批次**都记为 Failed；⑨ 单封的本地解析异常被当作连接级错误，让本批其余邮件一起 Failed | `uid_missing` 诊断；整批 `NO` 时逐封重试结构，只让被拒绝的那一封失败；本地异常只影响一封；所有 Failed 带原因代码与异常类型 |
+
+GitHub 一行中的 ⑦⑧⑨ 是根据代码路径与 Gmail 的已知行为推断、并在脚本化服务器中复现的；Windows 实测中具体是哪一种，请按 `docs/WindowsManualVerification.md` 第 14 节查看 `PreviewDiag` / `preview-diag` 日志中的 `r=` 确认。
+
+### 9.9 8 KiB 上限下仍然存在的限制
+
+- 邮件中正文文字之前的内容（HTML head 中的 CSS、条件注释、导航表格等，按**传输编码后**的字节计；base64 膨胀约 33%，QP 中每个 `=` 变为 `=3D`）超过约 8 KiB 时，预览得不到文字 ⇒ Unavailable（“打开邮件查看内容”），不会为了摘要下载更多；打开邮件后由完整正文生成摘要。
+- IMAP 只能按字节区间部分下载，无法在服务器端搜索 `<body>` 的位置；实现不做“跳过一段再读”的猜测（可能从正文中间开始、或落在 base64 / QP / 标签中间），因此第二次请求总是与第一次连续，或从 html 版本的开头读。
+- `multipart/mixed` 中第一个文本部分为空、真正的正文在后面的兄弟部分时，只看第一个正文位置（与打开正文的选择规则一致）。
+- 有用性判断（`IsUseful`）是保守的套话 / 链接识别，只决定是否值得用第二次请求；完整读完后只剩套话的邮件仍会显示这些文字。
+- 摘要中保留隐藏的 preheader（与 Gmail 等客户端一致）；若发件方把无关文字放在隐藏元素中，摘要也会显示它。
+
+## 10. 后续事项（不在 PR3 中修改代码）
+
+### 10.1 Gmail 已归档 / 已删除邮件出现在首页列表
+
+- **现象**：Gmail 账号中已归档（不在收件箱）和已删除（`[Gmail]/Trash`）的邮件也出现在首页列表中。
+- **原因**：同步覆盖 Inbox、Sent、Drafts、Trash、Junk、Archive（`ImapService` 中按 SPECIAL-USE 查找），而首页默认列表（`EmailStore.GetRecentAsync` / 每账号最近 100 封）**不按文件夹过滤**，因此 Trash、Junk、Sent 等文件夹的邮件与收件箱混在一起；预览候选使用同一查询，也会为这些文件夹生成预览。
+- **建议**：
+  1. 首页默认显示**多账号的 Inbox**（各账号服务器返回的收件箱，Gmail 为 `INBOX`），列表查询与预览候选同时加上文件夹条件；
+  2. 其它文件夹的数据继续同步、保留在本地，之后通过独立的文件夹入口访问（文件夹导航 / 筛选），不删除任何已同步的数据；
+  3. 预览候选范围随首页一起改为“当前显示的列表”，避免为不可见的文件夹消耗预览请求。
+- **需要评估**：在 Gmail 网页端归档一封邮件后，它从 `INBOX` 中移除（UID 消失），但本地 Inbox 记录要等下一次 UID 全量核对（Gmail 支持 CONDSTORE 但不支持 QRESYNC，间隔 6 小时，见第 5 节）才会删除；在此之前它仍显示在收件箱中，预览也会得到 `uid_missing`（Failed，退避）。可考虑：对 Inbox 缩短核对间隔、在预览得到 `uid_missing` 时提前触发该文件夹的 UID 核对，或使用 Gmail 的 `X-GM-LABELS` / `X-GM-MSGID` 识别归档。
+- PR3 不做文件夹管理重构；本事项在 GitHub issue [#4](https://github.com/zzvw/KeeprawMail/issues/4) 跟踪。

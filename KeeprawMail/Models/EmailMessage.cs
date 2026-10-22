@@ -84,7 +84,7 @@ namespace KeeprawMail.Models
 
         private KeeprawMail.Core.Storage.PreviewState _previewState = KeeprawMail.Core.Storage.PreviewState.Pending;
         /// <summary>
-        /// 列表摘要预览状态（Pending / Ready / NoText / Failed），与数据库 Emails.PreviewState 一致。
+        /// 列表摘要预览状态（Pending / Ready / NoText / Failed / Unavailable），与数据库 Emails.PreviewState 一致。
         /// </summary>
         public KeeprawMail.Core.Storage.PreviewState PreviewState
         {
@@ -112,6 +112,8 @@ namespace KeeprawMail.Models
                 {
                     KeeprawMail.Core.Storage.PreviewState.NoText => "无文本预览",
                     KeeprawMail.Core.Storage.PreviewState.Failed => "预览暂不可用",
+                    // 有文本，但在预览的有界下载（每封 8 KiB）内没有得到可用摘要：如实提示打开查看（打开后由完整正文生成摘要）
+                    KeeprawMail.Core.Storage.PreviewState.Unavailable => "打开邮件查看内容",
                     _ => "正在加载预览…",
                 };
             }

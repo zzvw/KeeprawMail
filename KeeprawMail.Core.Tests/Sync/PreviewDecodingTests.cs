@@ -165,6 +165,80 @@ public class PreviewDecodingTests
         Assert.DoesNotContain("<", html);
     }
 
+    [Theory]
+    // 省略 </head>（HTML 允许）：旧做法在截断内容中从“未闭合的 <head”处截断 ⇒ 全部丢失
+    [InlineData("<html><head><meta charset=utf-8><style>p{color:red}</style><body><p>Package arrived</p>", true, "Package arrived")]
+    [InlineData("<html><head><style>p{color:red}</style><div>Implicit body</div>", true, "Implicit body")]
+    // style 中的 "<!--"、"<p>"、"</div>" 不影响：一直跳到 </style>
+    [InlineData("<style>a:before{content:\"<!--\"} .x{content:\"<p>evil</p></div>\"}</style><p>Real</p>", false, "Real")]
+    // 空注释 <!--> 与下层显示的条件注释：内容照常显示；mso 条件注释中的内容不显示
+    [InlineData("<!--[if !mso]><!--><p>Shown</p><!--<![endif]--><!--[if mso]><p>Outlook</p><![endif]--><![if !mso]><p>Also</p><![endif]>", false, "Shown Also")]
+    [InlineData("<!--><p>After empty comment</p>", false, "After empty comment")]
+    // 属性值中的 ">"（只认紧跟 = 的引号）；未加引号的值里的引号不开始带引号的值
+    [InlineData("<table data-x=\"a > b\" width=50%\"><tr><td>Cell</td></tr></table>", false, "Cell")]
+    // 截断在 </style 结束标记中 / 截断在 title 中
+    [InlineData("<p>Before</p><style>.a{}</sty", true, "Before")]
+    [InlineData("<html><head><title>Subj", true, "")]
+    // a < b 中的 "<" 是文本
+    [InlineData("<p>1 < 2 &amp;&amp; 3 > 2</p>", false, "1 < 2 && 3 > 2")]
+    // display:none 预览文字 + 零宽 / &zwnj; / &nbsp; / &#8199; 填充
+    [InlineData("<div style=\"display:none\">Preheader text&zwnj;&nbsp;&zwnj;&nbsp;&#8199;&#65279;&#847;</div><p>Body</p>", false, "Preheader text Body")]
+    public void HtmlStripper_RealWorldConstructs(string html, bool truncated, string expected)
+    {
+        Assert.Equal(expected, PreviewTextExtractor.Extract(Encoding.UTF8.GetBytes(html), "8bit", "utf-8", true, truncated));
+    }
+
+    [Fact]
+    public void HtmlStripper_StyleSpanningTwoWindows_SameResultAsOneScan()
+    {
+        var html = "<html><head><style>" + string.Concat(Enumerable.Range(0, 300).Select(i => $".c{i}{{margin:{i}px}}\n")) + "</style></head><body><p>Text after css</p></body></html>";
+        var bytes = Encoding.UTF8.GetBytes(html);
+        // 第一个窗口结束在 style 中：没有文字（也绝不输出 CSS）
+        Assert.Equal("", PreviewTextExtractor.Extract(bytes.AsSpan(0, 2048), "8bit", "utf-8", true, truncated: true));
+        // 两个窗口拼接后整体扫描
+        Assert.Equal("Text after css", PreviewTextExtractor.Extract(bytes, "8bit", "utf-8", true, truncated: false));
+    }
+
+    [Theory]
+    [InlineData("8bit", "identity")]
+    [InlineData(" 8-bit ", "identity")]
+    [InlineData("7BITS", "identity")]
+    [InlineData("\"binary\"", "identity")]
+    [InlineData(null, "identity")]
+    [InlineData("Base-64", "base64")]
+    [InlineData("QUOTED-PRINTABLE", "quoted-printable")]
+    [InlineData("quoted printable", "quoted-printable")]
+    [InlineData("x-uuencode", null)]
+    public void TransferEncoding_Aliases(string? cte, string? expected)
+    {
+        Assert.Equal(expected, TruncatedTransferDecoder.Normalize(cte));
+    }
+
+    [Theory]
+    [InlineData("Hello there", true)]
+    [InlineData("你好，订单已发货", true)]
+    [InlineData("Refund 248.60", true)]
+    [InlineData("View this email in your browser <https://click.example.test/?qs=1>", false)]
+    [InlineData("https://click.example.test/?qs=abcdef", false)]
+    [InlineData("Having trouble viewing this email? View it in your browser.", false)]
+    [InlineData("Click here to view this email online", false)]
+    [InlineData("如果无法正常显示，请在浏览器中查看", false)]
+    [InlineData("View in browser. Your flight AA100 is confirmed", true)]
+    public void Useful_RejectsLinksAndViewInBrowserBoilerplate(string snippet, bool useful)
+    {
+        Assert.Equal(useful, PreviewTextExtractor.IsUseful(snippet));
+        Assert.True(PreviewTextExtractor.IsMeaningful(snippet)); // 这些都“有字”，只是不一定值得作为摘要
+    }
+
+    [Fact]
+    public void Diagnostics_Sanitized_NoContentOrServerText()
+    {
+        var d = PreviewDiagnostics.Format("server_no; DROP TABLE", "text/plain,text/html", 2, 8192, "ImapCommandException: user@example.com");
+        Assert.Equal("r=server_noDROPTABLE;t=text/plain,text/html;q=2;b=8192;x=ImapCommandException:userexample.com", d);
+        Assert.DoesNotContain(" ", d);
+        Assert.DoesNotContain("@", d);
+    }
+
     [Fact]
     public void Meaningful_RequiresLetterOrDigit()
     {

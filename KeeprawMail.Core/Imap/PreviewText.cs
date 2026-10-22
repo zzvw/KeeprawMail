@@ -1,25 +1,33 @@
 using System.Text;
+using System.Text.RegularExpressions;
 using MailKit;
 
 namespace KeeprawMail.Core.Imap;
 
-/// <summary>预览所选的 MIME 部分。<see cref="HtmlAlternative"/>：同一 multipart/alternative 中的 html 版本（纯文本部分没有有意义文本时可改用它）。</summary>
-public sealed record PreviewPartChoice(BodyPartText Part, bool IsHtml, BodyPartText? HtmlAlternative);
+/// <summary>
+/// 预览可用的正文部分（只看 BODYSTRUCTURE）。<see cref="Plain"/> 与 <see cref="Html"/> 来自同一个“正文位置”
+/// （同一个 multipart/alternative，或单独的一个文本部分），任一可为 null，但不会都为 null。
+/// </summary>
+public sealed record PreviewPartChoice(BodyPartText? Plain, BodyPartText? Html)
+{
+    /// <summary>所选部分的 MIME 类型（诊断用，只含类型，不含参数）。</summary>
+    public string MimeTypes => PreviewDiagnostics.Types(new[] { Plain, Html });
+}
 
 /// <summary>
-/// 列表预览的正文部分选择（只看 BODYSTRUCTURE，不下载任何内容）。与打开邮件时的 <see cref="BodyPartSelector"/> 不同，预览优先 text/plain：
-///  * multipart/alternative：优先 text/plain，没有时取 text/html（多个候选时取最后一个）；
+/// 列表预览的正文部分选择（只看 BODYSTRUCTURE，不下载任何内容）。与打开邮件时的 <see cref="BodyPartSelector"/> 不同，预览优先 text/plain，
+/// 但同时保留同一 alternative 中的 text/html，供纯文本版本为空 / 只有链接或“在浏览器中查看”之类套话时在同一预算内改读：
+///  * multipart/alternative：text/plain 与 text/html 都记下（多个候选时取最后一个）；
 ///  * multipart/mixed、related、signed 等：按顺序取第一个能提供正文的子部分（之后的部分视为附件 / 内嵌资源）；
 ///  * Content-Disposition: attachment 的文本部分、message/rfc822 附带的邮件、text/calendar 等其它文本类型、二进制部分一律不作为正文。
+/// 返回 null 表示“确实没有文本正文部分”（例如只有附件）——这是唯一会被判定为永久 NoText 的结构情形。
 /// </summary>
 public static class PreviewPartSelector
 {
     public static PreviewPartChoice? Select(BodyPart? root)
     {
         var (plain, html) = Collect(root);
-        if (plain != null) return new PreviewPartChoice(plain, false, html);
-        if (html != null) return new PreviewPartChoice(html, true, null);
-        return null;
+        return plain == null && html == null ? null : new PreviewPartChoice(plain, html);
     }
 
     private static (BodyPartText? Plain, BodyPartText? Html) Collect(BodyPart? part)
@@ -56,6 +64,23 @@ public static class PreviewPartSelector
 
     private static bool IsAttachment(BodyPartBasic part) =>
         part.ContentDisposition != null && part.ContentDisposition.Disposition.Equals("attachment", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>结构中所有叶子部分的 MIME 类型（诊断用，最多 4 个，去重）。</summary>
+    public static string LeafTypes(BodyPart? root)
+    {
+        var list = new List<BodyPartBasic>();
+        void Walk(BodyPart? p)
+        {
+            if (list.Count >= 8) return;
+            switch (p)
+            {
+                case BodyPartMultipart m: foreach (var c in m.BodyParts) Walk(c); break;
+                case BodyPartBasic b: list.Add(b); break;
+            }
+        }
+        Walk(root);
+        return PreviewDiagnostics.Types(list);
+    }
 }
 
 /// <summary>
@@ -63,16 +88,15 @@ public static class PreviewPartSelector
 ///  * base64：只解码完整的 4 字符组，末尾不完整的组丢弃；忽略换行与非法字符；支持中途出现的 '=' 填充；
 ///  * quoted-printable：处理 =XX 与软换行，末尾不完整的 "=" / "=X" / "=\r" 丢弃，非法转义按原样保留；
 ///  * 7bit / 8bit / binary / 未声明：原样返回。
-/// 未知的传输编码（如 x-uuencode）返回 null（调用方记为无文本预览）。
+/// 未知的传输编码（如 x-uuencode）返回 null（调用方不下载，记为 Unavailable / unknown_cte，而不是 NoText）。
 /// </summary>
 public static class TruncatedTransferDecoder
 {
     public static byte[]? Decode(ReadOnlySpan<byte> raw, string? contentTransferEncoding, bool truncated)
     {
-        var cte = contentTransferEncoding?.Trim().Trim('"').ToLowerInvariant();
-        switch (cte)
+        switch (Normalize(contentTransferEncoding))
         {
-            case null or "" or "7bit" or "8bit" or "binary":
+            case "identity":
                 return raw.ToArray();
             case "base64":
                 return DecodeBase64(raw, truncated);
@@ -81,6 +105,24 @@ public static class TruncatedTransferDecoder
             default:
                 return null;
         }
+    }
+
+    /// <summary>
+    /// 规范化传输编码名称：容忍真实邮件中常见的非标准写法（大小写、引号、空白、"8-bit"、"7bits"、"base-64"、"quoted printable"、"qp"…）。
+    /// 返回 "identity"、"base64"、"quoted-printable"，或 null（确实未知，如 x-uuencode）。
+    /// </summary>
+    public static string? Normalize(string? contentTransferEncoding)
+    {
+        var cte = contentTransferEncoding?.Trim().Trim('"', '\'').Trim().ToLowerInvariant();
+        if (string.IsNullOrEmpty(cte)) return "identity";
+        var compact = cte.Replace("-", "").Replace("_", "").Replace(" ", "");
+        return compact switch
+        {
+            "7bit" or "8bit" or "7bits" or "8bits" or "binary" or "none" or "plain" or "text" or "ascii" or "xbinary" => "identity",
+            "base64" or "b64" or "xbase64" => "base64",
+            "quotedprintable" or "qp" or "xquotedprintable" => "quoted-printable",
+            _ => null,
+        };
     }
 
     private static int B64(byte c) => c switch
@@ -208,7 +250,7 @@ public static class TruncatedTransferDecoder
 }
 
 /// <summary>把（可能被截断的）MIME 部分内容变成列表摘要。</summary>
-public static class PreviewTextExtractor
+public static partial class PreviewTextExtractor
 {
     /// <summary>
     /// 传输解码 → 字符集解码（截断时丢弃末尾不完整的多字节字符） → <see cref="SnippetBuilder"/>（HTML 去掉 head/style/script/注释与标签、解码实体、压缩空白）。
@@ -230,4 +272,110 @@ public static class PreviewTextExtractor
             if (Rune.IsLetterOrDigit(r)) return true;
         return false;
     }
+
+    /// <summary>
+    /// 有意义且不只是链接 / “在浏览器中查看”“退订”之类的套话：去掉 URL、常见套话与少量功能词后仍有内容。
+    /// 只用于决定“是否值得用剩余预算再读一次（或改读 html 版本）”；完整读完后只剩套话的邮件仍会显示这些文字。
+    /// </summary>
+    public static bool IsUseful(string? snippet)
+    {
+        if (!IsMeaningful(snippet)) return false;
+        var s = UrlRegex().Replace(snippet!, " ");
+        s = BoilerplateRegex().Replace(s, " ");
+        foreach (Match m in WordRegex().Matches(s))
+        {
+            var w = m.Value;
+            if (StopWords.Contains(w)) continue;
+            if (w.Length >= 2 || w[0] > 0x7F || char.IsDigit(w[0])) return true;
+        }
+        return false;
+    }
+
+    private static readonly HashSet<string> StopWords = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "to", "if", "it", "is", "a", "an", "the", "this", "that", "email", "e", "mail", "message", "please", "or", "and", "you", "your",
+        "can", "here", "on", "in", "of", "for", "at", "as", "be", "not", "are", "view", "online", "browser", "version", "link", "copy", "paste",
+        "邮件", "此", "本", "请", "或", "您", "如果", "若", "查看", "点击", "打开",
+    };
+
+    [GeneratedRegex(@"(?:https?://|mailto:|www\.)\S+|<[^<>\s]+>", RegexOptions.IgnoreCase)]
+    private static partial Regex UrlRegex();
+
+    [GeneratedRegex(@"(?:view|read|open|see|display)\s+(?:this|the|our|it)?\s*(?:e-?mail|message|newsletter|version)?\s*(?:online|on\s+(?:the\s+)?web|in\s+(?:your|a|the)\s+(?:web\s+)?browser|as\s+a\s+web\s*page)" +
+        @"|(?:web|online|browser|mobile)\s+version|having\s+(?:trouble|problems?)\s+(?:viewing|reading|seeing)|click\s+here|unsubscribe|manage\s+(?:your\s+)?preferences|privacy\s+policy" +
+        @"|(?:在|用)?浏览器(?:中)?(?:查看|打开|浏览)|查看网页版|网页版|无法(?:正常)?(?:显示|查看|阅读)|点击(?:此处|这里)|退订", RegexOptions.IgnoreCase)]
+    private static partial Regex BoilerplateRegex();
+
+    [GeneratedRegex(@"[\p{L}\p{N}]+")]
+    private static partial Regex WordRegex();
+}
+
+/// <summary>
+/// 预览诊断（脱敏）：只记录原因代码、MIME 类型、请求数、字节数，以及失败时的异常类型名。
+/// 绝不包含正文内容、主题、地址、凭据或服务器返回的文字。格式（紧凑、可持久化到 Emails.PreviewDiag）：
+/// <c>r=&lt;原因&gt;;t=&lt;类型,类型&gt;;q=&lt;请求数&gt;;b=&lt;字节数&gt;[;x=&lt;异常类型&gt;]</c>，例如 <c>r=beyond_budget;t=text/plain,text/html;q=2;b=8192</c>。
+/// 文件夹不写入该列（同一行的 Mailbox 列已经是文件夹），日志行中另行给出。
+/// </summary>
+public static partial class PreviewDiagnostics
+{
+    /// <summary>原因代码。</summary>
+    public static class Reasons
+    {
+        // NoText（永久：确实没有可预览的文本）
+        public const string NoTextPart = "no_text_part";       // BODYSTRUCTURE 中没有 text/plain / text/html 正文部分（如只有附件）
+        public const string EmptyText = "empty_text";          // 文本部分已在预算内完整读完，但没有任何文字
+        // Unavailable（有文本部分，但在 8 KiB / 2 次请求内得不到可用摘要；打开邮件后由完整正文生成）
+        public const string BeyondBudget = "beyond_budget";
+        public const string UnknownEncoding = "unknown_cte";
+        public const string NoStructure = "no_structure";
+        public const string CacheMissing = "cache_missing";
+        // Failed（退避后重试）
+        public const string UidMissing = "uid_missing";         // 该 UID 已不在服务器文件夹中（被移动 / 归档 / 删除，本地记录待 UID 核对清除）
+        public const string ServerNo = "server_no";             // 部分下载被服务器以 NO / BAD 拒绝
+        public const string StructureNo = "server_no_structure"; // 该邮件的 BODYSTRUCTURE 被服务器以 NO / BAD 拒绝
+        public const string Connection = "connection";          // 断线 / 协议错误 / 超时：本批之后的邮件也记为失败
+        public const string LocalError = "local_error";         // 本地解析 / 解码异常（只影响这一封）
+        public const string StructureFetch = "structure_fetch"; // 整批 BODYSTRUCTURE 请求失败
+        public const string Session = "session";               // 无法建立会话（离线、需要重新授权…）
+        public const string NotReturned = "not_returned";       // 服务器没有返回该 UID 的结果
+    }
+
+    public static string Format(string reason, string? mimeTypes, int requests, long bytes, string? exceptionType = null)
+    {
+        var sb = new StringBuilder(64);
+        sb.Append("r=").Append(Token(reason));
+        if (!string.IsNullOrEmpty(mimeTypes)) sb.Append(";t=").Append(mimeTypes);
+        sb.Append(";q=").Append(requests.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        sb.Append(";b=").Append(bytes.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        if (!string.IsNullOrEmpty(exceptionType)) sb.Append(";x=").Append(Token(exceptionType));
+        var s = sb.ToString();
+        return s.Length <= 200 ? s : s[..200];
+    }
+
+    /// <summary>MIME 类型列表（只保留 type/subtype 中的合法字符，去重，最多 4 个）。</summary>
+    public static string Types(IEnumerable<BodyPartBasic?> parts)
+    {
+        var list = new List<string>();
+        foreach (var p in parts)
+        {
+            if (p == null) continue;
+            var t = MimeTokenRegex().Replace(p.ContentType.MimeType.ToLowerInvariant(), "");
+            if (t.Length > 60) t = t[..60];
+            if (t.Length > 0 && !list.Contains(t)) list.Add(t);
+            if (list.Count == 4) break;
+        }
+        return string.Join(",", list);
+    }
+
+    private static string Token(string s)
+    {
+        var t = TokenRegex().Replace(s, "");
+        return t.Length <= 60 ? t : t[..60];
+    }
+
+    [GeneratedRegex(@"[^a-z0-9!#$&^_.+\-/]")]
+    private static partial Regex MimeTokenRegex();
+
+    [GeneratedRegex(@"[^A-Za-z0-9_.:\-]")]
+    private static partial Regex TokenRegex();
 }

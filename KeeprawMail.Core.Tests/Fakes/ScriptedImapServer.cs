@@ -58,6 +58,12 @@ public sealed partial class ScriptedImapServer : IAsyncDisposable
 
     /// <summary>故障注入：对指定 UID 的部分下载返回 "NO"（单封失败）或 "DROP"（断开连接）；返回 null 时正常。</summary>
     public Func<uint, string?>? PartialFetchFault { get; set; }
+
+    /// <summary>
+    /// 故障注入：UID FETCH … BODYSTRUCTURE 的 UID 集合中只要有一个 UID 使其返回 true，整条命令就回答
+    /// "NO Some messages could not be FETCHed (Failure)"（Gmail 在集合中某一封无法取出时的真实行为），不返回任何数据。
+    /// </summary>
+    public Func<uint, bool>? StructureFetchFault { get; set; }
     public long BytesSent;
 
     public ScriptedImapServer()
@@ -203,6 +209,13 @@ public sealed partial class ScriptedImapServer : IAsyncDisposable
                             var action = fm.Success ? fault(uint.Parse(fm.Groups[1].Value, CultureInfo.InvariantCulture)) : null;
                             if (action == "NO") { await WriteAsync(stream, $"{tag} NO [SERVERBUG] injected failure\r\n"); continue; }
                             if (action == "DROP") return;
+                        }
+                        if (StructureFetchFault is { } sf && byUid && upper.Contains("BODYSTRUCTURE"))
+                        {
+                            var setArg = rest["UID FETCH ".Length..].Split(' ')[0];
+                            bool hit;
+                            lock (_gate) hit = MatchUidSet(selected.Messages.Select(m => m.Uid).ToList(), setArg).Any(sf);
+                            if (hit) { await WriteAsync(stream, $"{tag} NO Some messages could not be FETCHed (Failure)\r\n"); continue; }
                         }
                         var bytes = HandleFetch(selected, rest[(byUid ? "UID FETCH ".Length : "FETCH ".Length)..], byUid);
                         await WriteBytesAsync(stream, bytes);
@@ -516,7 +529,9 @@ public sealed partial class ScriptedImapServer : IAsyncDisposable
             {
                 var content = ContentBytes(part);
                 var ct = part.ContentType;
-                var cte = part.ContentTransferEncoding switch
+                // 与真实服务器一样报告邮件头中声明的传输编码原文（包括 "8-bit"、"x-uuencode" 等非标准值）；没有声明时按 MimeKit 的编码
+                var declaredCte = part.Headers[HeaderId.ContentTransferEncoding];
+                var cte = !string.IsNullOrWhiteSpace(declaredCte) ? declaredCte.Trim().ToUpperInvariant() : part.ContentTransferEncoding switch
                 {
                     ContentEncoding.Base64 => "BASE64",
                     ContentEncoding.QuotedPrintable => "QUOTED-PRINTABLE",

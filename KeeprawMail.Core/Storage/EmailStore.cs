@@ -34,10 +34,29 @@ public enum PreviewState
     Pending = 0,
     /// <summary>Snippet 是有效的纯文本摘要。不会再次获取。</summary>
     Ready = 1,
-    /// <summary>没有可预览的文本（只有附件、或有界字节内没有文本）。每次同步都不会重试。</summary>
+    /// <summary>
+    /// 确实没有可预览的文本：BODYSTRUCTURE 中没有文本正文部分（只有附件等），或文本部分已完整读完但没有文字。
+    /// 当前预览算法下不再重试（PreviewAlgo 记录产生它的算法版本，算法升级时可有选择地重新尝试）。
+    /// </summary>
     NoText = 2,
     /// <summary>获取失败；按 PreviewNextRetryAt 退避后重试。</summary>
     Failed = 3,
+    /// <summary>
+    /// 有文本部分，但在有界预算（每封 8 KiB / 2 次请求）内没有得到可用摘要（如 HTML 头部 CSS 超过 8 KiB），或传输编码未知、服务器不提供结构。
+    /// 与 NoText 区分：列表显示“打开邮件查看内容”，打开后由完整正文生成摘要；当前算法下不自动重试（结果不会变）。
+    /// </summary>
+    Unavailable = 4,
+}
+
+/// <summary>列表预览算法版本（Emails.PreviewAlgo）。</summary>
+public static class PreviewAlgorithm
+{
+    /// <summary>
+    /// 0：结构版本 5 之前写入的预览状态（PR3 第一版算法，或 v4 迁移回填）；
+    /// 1：当前算法（alternative 中纯文本无用时改读 html、有状态 HTML 扫描、NoText / Unavailable 区分、脱敏诊断）。
+    /// 写入 Ready / NoText / Unavailable 时记录当前版本；迁移只重置旧版本写入的 NoText，因此每行最多重新尝试一次。
+    /// </summary>
+    public const int Current = 1;
 }
 
 /// <summary>
@@ -53,10 +72,13 @@ public static class MailStoreSchema
     ///  * 2：重建一次 FTS，清除历史 REPLACE 留下的残留；
     ///  * 3：Emails 增加 ImapUid 列（从旧 Id 回填）与 (AccountId, Mailbox, ImapUid) 索引，新增 MailboxSyncState 表；
     ///  * 4：Emails 增加列表预览状态列 PreviewState / PreviewAttempts / PreviewNextRetryAt（只在从 &lt; 4 升级时回填一次：
-    ///       已有摘要 ⇒ Ready；已缓存正文但摘要为空 ⇒ NoText；其余 ⇒ Pending）。
+    ///       已有摘要 ⇒ Ready；已缓存正文但摘要为空 ⇒ NoText；其余 ⇒ Pending）；
+    ///  * 5：Emails 增加 PreviewAlgo（产生当前预览状态的算法版本）与 PreviewDiag（脱敏诊断），PreviewState 新增 4 Unavailable；
+    ///       只在从 &lt; 5 升级时执行一次（与 user_version 同一事务）：旧算法写入的、没有正文缓存的 NoText 重置为 Pending（重新预览一次），
+    ///       旧的 Failed 清除退避立即重试；有正文缓存的旧 NoText 保持原状，由预览任务从本地缓存零网络重新生成摘要（PreviewAlgo &lt; 当前版本的行，只做一次）。
     /// 每一步都是幂等的（IF NOT EXISTS / 列存在检查 / 只回填 NULL），重复执行不会删除任何账号、邮件、正文缓存或凭据。
     /// </summary>
-    public const int SchemaVersion = 4;
+    public const int SchemaVersion = 5;
 
     public const string EmailsTableSql = @"
         CREATE TABLE IF NOT EXISTS Emails (
@@ -75,6 +97,8 @@ public static class MailStoreSchema
             PreviewState INTEGER NOT NULL DEFAULT 0,
             PreviewAttempts INTEGER NOT NULL DEFAULT 0,
             PreviewNextRetryAt TEXT,
+            PreviewAlgo INTEGER NOT NULL DEFAULT 0,
+            PreviewDiag TEXT,
             FOREIGN KEY(AccountId) REFERENCES Accounts(Id)
         );";
 
@@ -157,6 +181,19 @@ public static class MailStoreSchema
             ELSE 0 END
         WHERE PreviewState = 0;";
 
+    /// <summary>
+    /// v5：一次性重新尝试旧算法的 NoText。只改预览列（不改 Snippet、BodyLocalPath、已读 / 星标、UID 或同步状态，FTS 不受影响）。
+    /// 条件中的 PreviewAlgo &lt; 1 保证只作用于 v5 之前写入的行；没有正文缓存的才重置为 Pending（有缓存的由本地重算处理，零网络）。
+    /// </summary>
+    private const string RetryLegacyNoTextSql = @"
+        UPDATE Emails SET PreviewState = 0, PreviewAttempts = 0, PreviewNextRetryAt = NULL, PreviewDiag = NULL
+        WHERE PreviewState = 2 AND PreviewAlgo < 1 AND IFNULL(BodyLocalPath, '') = '' AND IFNULL(Snippet, '') = '';";
+
+    /// <summary>v5：旧算法留下的 Failed 清除退避，下次预览立即重试一次（之后按正常退避）。</summary>
+    private const string RetryLegacyFailedSql = @"
+        UPDATE Emails SET PreviewAttempts = 0, PreviewNextRetryAt = NULL
+        WHERE PreviewState = 3 AND PreviewAlgo < 1;";
+
     /// <summary>建 Emails / FTS / 触发器 / PendingCleanup / MailboxSyncState（幂等）。需要 Accounts 表已存在。</summary>
     public static async Task EnsureAsync(SqliteConnection c, CancellationToken ct = default)
     {
@@ -215,6 +252,17 @@ public static class MailStoreSchema
                 await ExecAsync(c, tx, "ALTER TABLE Emails ADD COLUMN PreviewNextRetryAt TEXT", ct).ConfigureAwait(false);
             if (version < 4)
                 await ExecAsync(c, tx, BackfillPreviewStateSql, ct).ConfigureAwait(false);
+
+            // ---- v5：预览算法版本与诊断列（列存在检查，幂等）；旧算法 NoText / Failed 的一次性重试只在从 < 5 升级时执行 ----
+            if (!cols.Contains("PreviewAlgo"))
+                await ExecAsync(c, tx, "ALTER TABLE Emails ADD COLUMN PreviewAlgo INTEGER NOT NULL DEFAULT 0", ct).ConfigureAwait(false);
+            if (!cols.Contains("PreviewDiag"))
+                await ExecAsync(c, tx, "ALTER TABLE Emails ADD COLUMN PreviewDiag TEXT", ct).ConfigureAwait(false);
+            if (version < 5)
+            {
+                await ExecAsync(c, tx, RetryLegacyNoTextSql, ct).ConfigureAwait(false);
+                await ExecAsync(c, tx, RetryLegacyFailedSql, ct).ConfigureAwait(false);
+            }
 
             if (version < SchemaVersion)
                 await ExecAsync(c, tx, $"PRAGMA user_version = {SchemaVersion};", ct).ConfigureAwait(false);
@@ -338,7 +386,7 @@ public sealed partial class EmailStore
         await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
     }
 
-    internal static PreviewState ToPreviewState(long v) => v is >= 0 and <= 3 ? (PreviewState)v : PreviewState.Pending;
+    internal static PreviewState ToPreviewState(long v) => v is >= 0 and <= 4 ? (PreviewState)v : PreviewState.Pending;
 
     private static async Task<List<StoredEmail>> ReadAsync(SqliteCommand cmd, CancellationToken ct)
     {

@@ -100,18 +100,18 @@ namespace KeeprawMail.ViewModels
                 foreach (var email in localEmails)
                 {
                     // 读库期间后台预览刚写入的结果：补到新列表项上（否则会被读到的旧状态覆盖）
-                    if (_recentPreviewUpdates.TryGetValue(email.Id, out var update) && email.PreviewState is Core.Storage.PreviewState.Pending or Core.Storage.PreviewState.Failed)
+                    if (_recentPreviewUpdates.TryGetValue(email.Id, out var update) && email.PreviewState is not Core.Storage.PreviewState.Ready)
                         ApplyPreview(email, update);
                     Emails.Add(email);
                 }
                 _recentPreviewUpdates.Clear();
 
-                // 启动后第一次加载列表：为列表中尚未生成预览的邮件安排后台预览（不阻塞界面，失败不影响列表）
+                // 启动后第一次加载列表：为列表中的每个账号安排一次后台预览（不阻塞界面，失败不影响列表）。
+                // 没有 Pending / 到期 Failed 的账号不会建立任何连接；旧算法留下的“有正文缓存的 NoText”在这一轮从本地缓存重算（零网络，只做一次）。
                 if (!_startupPreviewsScheduled)
                 {
                     _startupPreviewsScheduled = true;
-                    foreach (var accountId in Emails.Where(e => e.PreviewState is Core.Storage.PreviewState.Pending or Core.Storage.PreviewState.Failed && string.IsNullOrEmpty(e.BodyLocalPath))
-                                                    .Select(e => e.AccountId).Distinct().ToList())
+                    foreach (var accountId in Emails.Select(e => e.AccountId).Distinct().ToList())
                         SchedulePreviews(accountId);
                 }
                 
@@ -248,7 +248,8 @@ namespace KeeprawMail.ViewModels
                     _databaseContext.CreateEmailStore(),
                     OpenAccountSessionAsync,
                     new Core.Preview.MailPreviewOptions { PerAccountLimit = Core.Storage.EmailStore.DefaultPerAccountLimit },
-                    log: line => DiagnosticLog.Write("preview", line));
+                    log: line => DiagnosticLog.Write("preview", line),
+                    bodyCache: Data.AppPaths.BodyCache);
                 service.PreviewsUpdated += OnPreviewsUpdated;
                 _previewService = service;
                 return service;
@@ -293,8 +294,8 @@ namespace KeeprawMail.ViewModels
 
         private static void ApplyPreview(EmailMessage email, Core.Storage.AppliedPreview update)
         {
-            // 已打开过正文（有缓存）的邮件以正文生成的摘要为准
-            if (!string.IsNullOrEmpty(email.BodyLocalPath)) return;
+            // 已打开过正文（有缓存）且已有摘要的邮件以正文生成的摘要为准；有缓存但没有摘要的（旧算法 NoText）接受本地重算结果
+            if (!string.IsNullOrEmpty(email.BodyLocalPath) && !string.IsNullOrEmpty(email.Snippet)) return;
             if (update.State == Core.Storage.PreviewState.Ready) email.Snippet = update.Snippet;
             email.PreviewState = update.State;
         }

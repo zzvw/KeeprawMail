@@ -294,8 +294,9 @@ public partial class PreviewMailKitTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task Html_NoTextWithin8KiB_NoText_NeverDownloadsMore_NeverRetried()
+    public async Task Html_NoTextWithin8KiB_Unavailable_NotNoText_NeverDownloadsMore_NeverRetried()
     {
+        // 有 text/html 正文、但 head 中的 CSS 超过 8 KiB：预算内得不到摘要。这是“有文本但超出预算”（Unavailable），不是“没有文本”（NoText）
         _server.AddMailbox("INBOX");
         var css = string.Concat(Enumerable.Range(0, 1500).Select(i => $".c{i}{{color:#{i:x6}}}\n")); // ≈ 25 KB
         _server.Append("INBOX", Mail(1, Text("html", $"<html><head><style>{css}</style></head><body><p>late text</p></body></html>", Encoding.UTF8, ContentEncoding.Base64)));
@@ -303,14 +304,18 @@ public partial class PreviewMailKitTests : IAsyncLifetime
         _server.ResetCounters();
 
         var r = await Previews().RunOnceAsync("acc");
-        Assert.Equal(1, r.NoText);
+        Assert.Equal(1, r.Unavailable);
+        Assert.Equal(0, r.NoText);
         Assert.Equal(2, PartialCommands().Count);
         Assert.Equal(PreviewFetchLimits.MaxBytesPerMessage, _server.SectionBytesFor(1)); // 正好 8 KiB，绝不为了摘要下载整个正文
         var row = Assert.Single(await _db.MailboxAsync("acc", "INBOX"));
-        Assert.Equal(PreviewState.NoText, row.PreviewState);
+        Assert.Equal(PreviewState.Unavailable, row.PreviewState);
         Assert.Equal("", row.Snippet);
+        var info = await _db.Emails.GetPreviewInfoAsync(row.Id);
+        Assert.Equal("r=beyond_budget;t=text/html;q=2;b=8192", info!.Diagnostics); // 脱敏诊断：只有原因 / 类型 / 请求数 / 字节数
+        Assert.Equal(PreviewAlgorithm.Current, info.Algorithm);
 
-        // NoText 不再重试：没有候选时连连接都不建立
+        // Unavailable 在当前算法下不再重试（结果不会变）：没有候选时连连接都不建立
         _server.ResetCounters();
         SessionsOpened = 0;
         await SyncAsync();

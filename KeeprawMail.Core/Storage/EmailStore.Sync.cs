@@ -47,7 +47,7 @@ public sealed partial class EmailStore
 
                     using var u = c.CreateCommand();
                     u.Transaction = tx;
-                    u.CommandText = "UPDATE Emails SET BodyLocalPath = '', Snippet = '', PreviewState = 0, PreviewAttempts = 0, PreviewNextRetryAt = NULL WHERE AccountId = $A AND Mailbox = $M AND ImapUid = $U";
+                    u.CommandText = "UPDATE Emails SET BodyLocalPath = '', Snippet = '', PreviewState = 0, PreviewAttempts = 0, PreviewNextRetryAt = NULL, PreviewDiag = NULL WHERE AccountId = $A AND Mailbox = $M AND ImapUid = $U";
                     u.Parameters.AddWithValue("$A", accountId);
                     u.Parameters.AddWithValue("$M", mailboxName);
                     u.Parameters.AddWithValue("$U", (long)uid);
@@ -363,11 +363,14 @@ public sealed partial class EmailStore
         cmd.CommandText = @"UPDATE Emails SET BodyLocalPath = $P,
             Snippet = CASE WHEN $S <> '' THEN $S ELSE IFNULL(Snippet, '') END,
             PreviewState = CASE WHEN $S <> '' OR IFNULL(Snippet, '') <> '' THEN 1 ELSE 2 END,
+            PreviewDiag = CASE WHEN $S <> '' OR IFNULL(Snippet, '') <> '' THEN NULL ELSE 'r=body_empty' END,
+            PreviewAlgo = $Algo,
             PreviewAttempts = 0, PreviewNextRetryAt = NULL
             WHERE Id = $Id";
         cmd.Parameters.AddWithValue("$Id", emailId);
         cmd.Parameters.AddWithValue("$P", bodyLocalPath ?? "");
         cmd.Parameters.AddWithValue("$S", snippet ?? "");
+        cmd.Parameters.AddWithValue("$Algo", PreviewAlgorithm.Current);
         return await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false) > 0;
     }
 

@@ -200,7 +200,7 @@ public class PreviewServiceTests : IAsyncLifetime
     public async Task SchemaV3ToV4_Upgrade_PreservesEverything_BackfillsPreviewState_Idempotent()
     {
         // 按 PR2 的 v3 结构准备数据库：账号（凭据在安全存储中）、邮件、摘要、正文缓存、同步状态
-        foreach (var col in new[] { "PreviewNextRetryAt", "PreviewAttempts", "PreviewState" })
+        foreach (var col in new[] { "PreviewDiag", "PreviewAlgo", "PreviewNextRetryAt", "PreviewAttempts", "PreviewState" })
             await _db.ExecAsync($"ALTER TABLE Emails DROP COLUMN {col}");
         await _db.ExecAsync("PRAGMA user_version = 3");
         Assert.Equal(0, await _db.ScalarAsync("SELECT COUNT(*) FROM pragma_table_info('Emails') WHERE name LIKE 'Preview%'"));
@@ -217,8 +217,8 @@ public class PreviewServiceTests : IAsyncLifetime
         await _db.Repo.EnsureSchemaAsync();
         await _db.Repo.EnsureSchemaAsync(); // 可重复执行
 
-        Assert.Equal(4, await _db.ScalarAsync("PRAGMA user_version"));
-        Assert.Equal(3, await _db.ScalarAsync("SELECT COUNT(*) FROM pragma_table_info('Emails') WHERE name LIKE 'Preview%'"));
+        Assert.Equal(MailStoreSchema.SchemaVersion, await _db.ScalarAsync("PRAGMA user_version")); // v3 → v4 → v5 一次完成
+        Assert.Equal(5, await _db.ScalarAsync("SELECT COUNT(*) FROM pragma_table_info('Emails') WHERE name LIKE 'Preview%'"));
         var rows = await _db.MailboxAsync("acc", "INBOX");
         Assert.Equal(new[] { PreviewState.Ready, PreviewState.NoText, PreviewState.Pending }, rows.Select(r => r.PreviewState));
         Assert.Equal(cached, rows[0].BodyLocalPath);

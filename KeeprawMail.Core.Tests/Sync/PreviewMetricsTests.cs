@@ -27,7 +27,7 @@ public class PreviewMetricsTests : IAsyncLifetime
     public async Task InitializeAsync()
     {
         _server = new ScriptedImapServer();
-        await _db.WithAccountsAsync("acc");
+        await _db.WithAccountsAsync("acc", "rw");
     }
 
     public async Task DisposeAsync()
@@ -56,6 +56,55 @@ public class PreviewMetricsTests : IAsyncLifetime
         // 固定 Message-ID：MimeKit 自动生成的 Message-ID 含本机主机名，会让元数据字节数随运行环境变化
         var m = new MimeMessage { Subject = $"Message {i}", Date = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero).AddMinutes(i), Body = builder.ToMessageBody(), MessageId = $"metrics{i}@example.test" };
         m.From.Add(new MailboxAddress($"Sender {i}", $"s{i}@example.test"));
+        return m;
+    }
+
+    private static string Css(int approxBytes)
+    {
+        var sb = new StringBuilder();
+        for (var i = 0; sb.Length < approxBytes; i++)
+            sb.Append($"@media only screen and (max-width:600px){{.col-{i}{{width:100% !important;padding:0 {i % 20}px !important;font-family:Arial,Helvetica,sans-serif}}}}\n");
+        return sb.ToString();
+    }
+
+    private static string Html(int cssBytes, string text) =>
+        "<!DOCTYPE html><html><head><!--[if gte mso 9]><xml><o:OfficeDocumentSettings><o:AllowPNG/></o:OfficeDocumentSettings></xml><![endif]-->" +
+        "<meta http-equiv=\"Content-Type\" content=\"text/html; charset=utf-8\"><title>Notice</title><style type=\"text/css\">" + Css(cssBytes) + "</style></head>" +
+        "<body><div style=\"display:none;max-height:0;overflow:hidden\">" + text + string.Concat(Enumerable.Repeat("&zwnj;&nbsp;", 60)) + "</div>" +
+        "<!--[if mso]><table><tr><td><![endif]--><table><tr><td>" + text + " " + string.Concat(Enumerable.Repeat("Footer. ", 400)) + "</td></tr></table></body></html>";
+
+    private static TextPart Part(string subtype, string text, ContentEncoding cte)
+    {
+        var p = new TextPart(subtype);
+        p.SetText(new UTF8Encoding(false), text);
+        p.ContentTransferEncoding = cte;
+        return p;
+    }
+
+    private static MimeMessage RealWorldMail(int i)
+    {
+        MimeEntity body = i switch
+        {
+            <= 5 => new MultipartAlternative { Part("plain", "\r\n", ContentEncoding.QuotedPrintable), Part("html", Html(5200, $"Your refund {i} is complete."), ContentEncoding.QuotedPrintable) },
+            <= 10 => new MultipartAlternative
+            {
+                Part("plain", $"@octocat commented on pull request #{i}.\n\n> In src/Preview.cs: 很长的一行 — 😀\n\nReply to this email directly, view it on GitHub:\nhttps://github.com/zzvw/KeeprawMail/pull/3", ContentEncoding.QuotedPrintable),
+                Part("html", $"<p><b>@octocat</b> commented on pull request #{i}.</p>", ContentEncoding.QuotedPrintable),
+            },
+            <= 15 => Part("html", Html(3000, $"Your parcel {i} has been shipped."), ContentEncoding.Base64),
+            <= 18 => new Multipart("mixed")
+            {
+                new MimePart("application", "pdf")
+                {
+                    Content = new MimeContent(new MemoryStream(Enumerable.Repeat((byte)i, 150_000).ToArray())),
+                    ContentDisposition = new ContentDisposition(ContentDisposition.Attachment) { FileName = $"doc{i}.pdf" },
+                    ContentTransferEncoding = ContentEncoding.Base64,
+                },
+            },
+            _ => Part("html", Html(12_000, $"Late text {i}."), ContentEncoding.QuotedPrintable),
+        };
+        var m = new MimeMessage { Subject = $"RW {i}", Date = new DateTimeOffset(2026, 3, 1, 0, 0, 0, TimeSpan.Zero).AddMinutes(i), Body = body, MessageId = $"rw{i}@example.test" };
+        m.From.Add(new MailboxAddress($"RW {i}", $"rw{i}@example.test"));
         return m;
     }
 
@@ -146,6 +195,23 @@ public class PreviewMetricsTests : IAsyncLifetime
         Assert.Equal(0, run!.Candidates);
         Assert.Equal(0, preview4.Commands);
 
+        // 7. 真实发件方结构混合（账号 rw，20 封）：AA 类（空纯文本 + 约 6 KB CSS 头部的 QP html）×5、GitHub 通知类（QP 纯文本 + html）×5、
+        //    Tiptrans 类（单部分 base64 html，style 跨越第一次下载边界）×5、只有附件 ×3、CSS 头部超过 8 KiB 的 html ×2
+        _server.AddMailbox("RealWorld");
+        for (var i = 1; i <= 20; i++) _server.Append("RealWorld", RealWorldMail(i));
+        await using (var s = await SessionAsync()) await _db.Engine().SyncAsync(s, "rw", "RealWorld");
+        var mix = await Measure(async () => run = await previews.RunOnceAsync("rw"));
+        var mixRun = run!;
+        Assert.Equal(20, mixRun.Candidates);
+        Assert.Equal((15, 3, 2, 0), (mixRun.Ready, mixRun.NoText, mixRun.Unavailable, mixRun.Failed));
+        Assert.Equal(0, mix.FullBodyFetches);
+        Assert.True(mix.MaxSectionBytesPerMessage <= PreviewFetchLimits.MaxBytesPerMessage);
+        Assert.All(_server.SectionsSent.GroupBy(x => x.Uid), g => Assert.True(g.Count() <= PreviewFetchLimits.MaxRequestsPerMessage));
+        Assert.DoesNotContain(_server.SectionsSent, x => x.Uid is >= 16 and <= 18); // 只有附件：0 次部分下载
+        var mix2 = await Measure(async () => run = await previews.RunOnceAsync("rw"));
+        Assert.Equal(0, run!.Candidates);
+        Assert.Equal(0, mix2.Commands);
+
         var textOctets = Encoding.UTF8.GetByteCount(((TextPart)Mail(1).BodyParts.First()).Text);
         var report = $@"
 PR3 列表摘要预览（500 封，每 5 封带 200 KB 附件；纯文本正文 UTF-8 约 {textOctets:N0} 字节、传输编码后更大（超过 4 KiB 预览上限）；列表每账号 100 封；统计 LOGIN/LIST/CAPABILITY 以外的 IMAP 命令与服务器发送的全部字节）
@@ -156,7 +222,11 @@ PR3 列表摘要预览（500 封，每 5 封带 200 KB 附件；纯文本正文 
 3. 无变化再同步                       : {sync2.Commands} 条命令, {sync2.Bytes:N0} 字节；随后预览：{preview2.Commands} 条命令, {preview2.Bytes} 字节（没有候选，不建立连接）
 4. 新增 10 封后同步                   : {sync3.Commands} 条命令, {sync3.Bytes:N0} 字节；随后预览：{preview3.Commands} 条命令（部分下载 {preview3.PartialFetches}）, {preview3.Bytes:N0} 字节，只涉及 UID 501–510
 5. 打开未缓存的带附件邮件             : {openUncached.Commands} 条命令, {openUncached.Bytes:N0} 字节，预览请求 {openUncached.PartialFetches}，附件发送 {(openUncached.AttachmentSent ? "是" : "否")}
-6. 再次打开（已缓存）                 : {openCached.Commands} 条命令, {openCached.Bytes} 字节；之后预览：{preview4.Commands} 条命令";
+6. 再次打开（已缓存）                 : {openCached.Commands} 条命令, {openCached.Bytes} 字节；之后预览：{preview4.Commands} 条命令
+7. 真实结构混合 20 封（AA 类 5 / GitHub 类 5 / Tiptrans 类 5 / 只有附件 3 / CSS 头部 > 8 KiB 2）：
+                                       {mix.Commands} 条命令（EXAMINE 1 + BODYSTRUCTURE {mixRun.StructureRequests} + 部分下载 {mix.PartialFetches}）, {mix.Bytes:N0} 字节；部分下载内容 {mix.SectionBytes:N0} 字节，
+                                       单封最多 {mix.MaxSectionBytesPerMessage:N0} 字节（上限 {PreviewFetchLimits.MaxBytesPerMessage}），完整正文下载 {mix.FullBodyFetches}；
+                                       结果 Ready {mixRun.Ready} / NoText {mixRun.NoText}（只有附件）/ Unavailable {mixRun.Unavailable}（CSS 头部超出 8 KiB）/ Failed {mixRun.Failed}；随后再预览：{mix2.Commands} 条命令";
         _out.WriteLine(report);
         await File.WriteAllTextAsync(Path.Combine(AppContext.BaseDirectory, "preview-request-metrics.txt"), report, new UTF8Encoding(false));
     }
