@@ -1,4 +1,4 @@
-# IMAP 增量同步、按需正文与列表摘要预览（PR #2 / PR #3 设计说明）
+# IMAP 增量同步、按需正文、列表摘要预览、统一收件箱与本地时间（PR #2 / PR #3 及后续修复设计说明）
 
 产品仍是 Windows 原生邮件客户端（WinUI 3 / Windows App SDK / WebView2 / MailKit / MimeKit / SQLite / Native AOT）。
 同步与正文逻辑放在 `KeeprawMail.Core`（可在 CI 中测试），WinUI 层只负责连接（统一代理 + TokenManager）与界面。
@@ -17,6 +17,8 @@
 | `IImapMailSession.FetchPreviewsAsync` | `Core/Imap/MailKitImapSession.cs` | PR3：BODYSTRUCTURE 批量 + 有界部分下载 `BODY.PEEK[section]<offset.count>` |
 | `EmailStore`（预览部分） | `Core/Storage/EmailStore.Preview.cs` | PR3：预览候选（与列表同一查询）与预览结果写入 |
 | `MailPreviewService` | `Core/Preview/MailPreviewService.cs` | PR3：后台预览任务（按账号合并、复用会话、可取消、退避） |
+| `EmailStore.DefaultListSourceSql` / `DefaultListFilterSql` / `ListOrderSql` | `Core/Storage/EmailStore.cs` | 默认首页（统一收件箱）与预览候选共用的筛选与排序（第 10 节） |
+| `MailDateFormatter` | `Core/Formatting/MailDateFormatter.cs` | 用户可见邮件时间按 Windows 系统时区显示（第 11 节） |
 
 ## 1. 数据库（结构版本 3）
 
@@ -73,12 +75,44 @@
 | 服务器能力 | 每次刷新 | 远端删除 | 旧邮件 Flags |
 |---|---|---|---|
 | QRESYNC（已 `ENABLE`） | `UID FETCH 1:游标 (FLAGS) (CHANGEDSINCE m)`，同时收到 `VANISHED` | 立即发现 | 立即一致 |
-| CONDSTORE（无 QRESYNC，Gmail 属此类） | `CHANGEDSINCE` 只取变化；MODSEQ 未变则不发请求 | 每 6 小时 UID-only 全量核对（`UID SEARCH ALL`） | 立即一致 |
-| 都不支持（QQ / 163 等常见） | 只检查最近 200 封（按本地 UID）的 Flags | 每 6 小时 UID-only 全量核对 | 每 6 小时全量核对时校正（按 1000 个 UID 一批，只取 FLAGS） |
+| CONDSTORE（无 QRESYNC，Gmail 属此类） | `CHANGEDSINCE` 只取变化；MODSEQ 未变则不发请求 | **EXISTS 少于本地时下一次同步立即发现**（移出检测，见下）；此外每 6 小时 UID-only 全量核对（`UID SEARCH ALL`） | 立即一致 |
+| 都不支持（QQ / 163 等常见） | 只检查最近 200 封（按本地 UID）的 Flags | **EXISTS 少于本地时下一次同步立即发现**；此外每 6 小时 UID-only 全量核对 | 每 6 小时全量核对时校正（按 1000 个 UID 一批，只取 FLAGS） |
 
 - 不支持增量变更通知的服务器**不能**保证每次刷新立即发现所有历史邮件的状态变化或删除；上表的间隔是保证的上限（以本机上次核对时间为准，持久化在 `LastFullReconcileAt`）。
 - 只有确认 UID 已不在服务器上（`UID SEARCH ALL` 结果或 `VANISHED`）才删除本地记录；只检查游标以内的 UID；所有删除仅作用于本地，同步全程以 `EXAMINE` 只读打开文件夹，不会触发任何服务器端删除或标记变化。
 - QRESYNC 的兜底全量核对间隔为 7 天；`ENABLE QRESYNC` 失败时自动退回 CONDSTORE / UID 核对策略。
+
+### 5.1 移出检测（EXISTS 计数触发的 UID-only 核对）
+
+Gmail 网页端**归档**一封邮件，只是去掉它的 `\Inbox` 标签：IMAP 上表现为该 UID 从 `INBOX` 中 EXPUNGE（邮件仍在 `[Gmail]/All Mail`）；**移入垃圾箱**则是从 `INBOX` 移出并在 `[Gmail]/Trash` 中以新 UID 出现。Gmail 支持 CONDSTORE 但不支持 QRESYNC，`CHANGEDSINCE` 不会报告被移出的 UID，因此 PR3 中本地 INBOX 记录要等 6 小时全量核对才删除。
+
+做法（`MailboxSyncEngine`，选项 `MailboxSyncOptions.DetectRemovalsByCount`，默认开启）：
+
+1. 每次增量同步都已发送 `EXAMINE`，响应中的 `EXISTS` 就是服务器该文件夹当前的邮件数，**不需要任何额外请求**；
+2. 新邮件处理完之后，比较 `EXISTS` 与本地该文件夹 `UID ≤ 游标` 的行数（`EmailStore.CountLocalUidsAsync`，本地 SQLite 查询）；
+3. 本地更多 ⇒ 服务器上有邮件离开了该文件夹（归档、移入垃圾箱、其它客户端移动或删除）⇒ 立即发送一次 `UID SEARCH ALL`（只返回 UID），删除本地游标以内、服务器上已不存在的 UID（与全量核对相同的删除规则与事务）；
+4. 计数一致 ⇒ 什么都不发。
+
+保证与边界：
+
+- 只删除 `UID SEARCH ALL` 确认不存在的 UID，删除只作用于该账号、该文件夹的本地记录（`(AccountId, Mailbox, UID)`）；同一封邮件在 Sent / All Mail 等其它文件夹中的记录、正文缓存、预览状态不受影响；
+- 全程 `EXAMINE` 只读，不发送 STORE / COPY / MOVE / EXPUNGE，不改服务器端邮件、标签或已读状态；
+- 不改 UIDVALIDITY、UID 游标或 MODSEQ，**不更新 `LastFullReconcileAt`**：无 CONDSTORE 服务器的全量 Flags 校正仍按 6 小时间隔进行；移出检测本身不取 Flags、正文或附件；
+- 归档与新邮件同时发生时（本地 = 旧数 + 新邮件，服务器 = 旧数 − 移出 + 新邮件）同样能发现；`EXAMINE` 之后、`SEARCH` 之前到达的新邮件只会让本地多于 `EXISTS`，最多多发一次 `UID SEARCH ALL`（无副作用）；
+- 本地缺少服务器上的某些行、且缺少数恰好等于被移出数时计数会相等——正常同步不会产生这种状态（游标只在批次持久化后前移）；6 小时全量核对仍是兜底。
+
+是否需要区分手动同步与后台同步：目前所有同步都由用户触发（工具栏“同步”按钮，或重新授权后同步该账号），没有定时后台同步；移出检测只在确有邮件被移出时才产生请求，因此**不区分**手动 / 后台。将来增加定时后台同步时，开销同样与用户在服务器上的操作次数成正比，而不是与同步次数成正比；如仍需限制，可只在手动同步时开启 `DetectRemovalsByCount`（选项已存在，无需改引擎）。
+
+流量（`ArchiveReconcileMetricsTests.GmailArchive_ManualSync_RequestCounts_Measured`，真实 MailKit ↔ 脚本化 IMAP 服务器，CONDSTORE、INBOX 5,000 封，结果写入 `archive-reconcile-metrics.txt` 并由 CI 打印上传）：
+
+| 场景 | IMAP 命令 | 服务器发送字节 |
+|---|---|---|
+| 无变化手动同步 | 1（EXAMINE） | 495 |
+| 网页端归档 1 封后手动同步 | 3（EXAMINE + CHANGEDSINCE + UID SEARCH ALL） | 24,444 |
+| 随后再次同步 | 1 | 495 |
+| 对照：关闭移出检测（PR3 行为） | 2 | 520（归档邮件仍在首页，最长 6 小时） |
+
+`UID SEARCH ALL` 的响应约为每封 INBOX 邮件 5 字节（UID 十进制位数 + 空格）：INBOX 1 万封约 60 KB，5 万封约 300 KB，只在检测到移出的那次同步发生一次；不下载正文、附件、元数据或 Flags。大邮箱中 `SEARCH ALL` 的服务器耗时与一次全量核对相同（Gmail 对 INBOX 通常在 1 秒内返回）。
 
 ## 6. 按需正文
 
@@ -190,13 +224,13 @@
 
 ### 9.4 后台预览任务（`MailPreviewService`）
 
-- 候选与列表使用同一查询：每个账号按 `Date` 倒序的前 100 封（`EmailStore.DefaultPerAccountLimit`，`PARTITION BY AccountId`），只取 Pending 或已到重试时间的 Failed、`ImapUid` 已知、未缓存正文的邮件；不是整个邮箱历史。**没有候选时不建立任何连接。**
+- 候选与列表使用同一查询（`EmailStore.DefaultListSourceSql`，第 10 节）：每个账号 **INBOX** 按真实时间倒序的前 100 封（`EmailStore.DefaultPerAccountLimit`，`PARTITION BY AccountId`；首页不显示的文件夹不是候选），只取 Pending 或已到重试时间的 Failed、`ImapUid` 已知、未缓存正文的邮件；不是整个邮箱历史。**没有候选时不建立任何连接。**
 - **本地缓存重算**（构造时传入正文缓存目录时；应用中传入 `AppPaths.BodyCache`）：每轮开始先处理该账号“有正文缓存、`PreviewState = 2`、`PreviewAlgo < 1`”的行（不受前 100 封限制，每轮最多 500 封），只读应用缓存目录内的文件（最多 2 MB），用当前摘要算法生成摘要：有文字 ⇒ Ready；缓存内容是打开正文时写入的“没有可显示的文本正文…”说明 ⇒ NoText（`no_text_part`）；HTML / 文本中确实没有文字 ⇒ NoText（`empty_text`）；缓存文件丢失或不可读 ⇒ Unavailable（`cache_missing`，打开邮件时会重新下载）。零网络，结果写入 `PreviewAlgo = 1`，因此只做一次。
 - 触发：每个账号的元数据同步完成后（同步报告不是 Failed 时）安排一次，不等待预览；应用启动后第一次加载列表时为列表中的**每个账号**安排一次（没有候选的账号不建立连接，只做上面的本地重算）。
 - 每个账号一个会话（`ImapService.OpenSessionAsync`：该账号自己的代理与 TokenManager），按文件夹分组复用，不按邮件重连或重新认证；文件夹按其中最新邮件排序、组内按时间倒序；每 20 封一批，每批结果立即写库并通知界面。
 - 同一账号重复请求合并：运行中再次请求只会在本轮结束后再跑一轮；不同账号可并行。
 - 失败隔离：见 9.1 第 6 条；整批 BODYSTRUCTURE 失败（连接级）时本批与之后的批次记为 Failed（`structure_fetch`）；会话建立失败（离线、需要重新授权）时候选记为 Failed（`session`）。预览任何失败都不会让成功的同步变成失败，也不推进或修改 UID 游标。
-- `Missing`（UID 已不在该文件夹）记为 Failed（`uid_missing`）并退避，不删除任何本地记录；本地陈旧记录由同步的 UID 核对删除（Gmail 每 6 小时一次，见第 5 节）。
+- `Missing`（UID 已不在该文件夹）记为 Failed（`uid_missing`）并退避，不删除任何本地记录；本地陈旧记录由同步的 UID 核对删除（移出检测在下一次同步时处理，兜底全量核对每 6 小时一次，见第 5、5.1 节）。
 - 界面：`PreviewsUpdated` 事件经 UI 线程的 `SynchronizationContext` 更新 `EmailMessage.Snippet` / `PreviewState`；列表重载与预览写入交错时，用最近收到的预览结果补齐新列表项。
 
 ### 9.5 列表显示
@@ -224,9 +258,10 @@
 | 新增 10 封后同步 / 随后预览 | 4 / 12 | 9,709 / 45,032 | 只预览 UID 501–510（部分下载 10） |
 | 打开未缓存的带附件邮件 | 3 | 1,174 | 只有 html 正文部分（MIME 头 + 内容），预览请求 0，附件 0 |
 | 再次打开（已缓存）/ 随后预览 | 0 / 0 | 0 / 0 | |
-| 真实结构混合 20 封（账号 rw）/ 随后再预览 | 31 / 0 | 106,083 / 0 | EXAMINE 1 + BODYSTRUCTURE 1 + 部分下载 29（AA 类 5×2、GitHub 类 5×1、Tiptrans 类 5×2、只有附件 3×0、CSS 头部 > 8 KiB 2×2）；部分内容 99,470 字节，单封最多 8,192；Ready 15 / NoText 3 / Unavailable 2 / Failed 0 |
+| 真实结构混合 20 封（账号 rw）/ 随后再预览 | 31 / 0 | 106,018 / 0 | EXAMINE 1 + BODYSTRUCTURE 1 + 部分下载 29（AA 类 5×2、GitHub 类 5×1、Tiptrans 类 5×2、只有附件 3×0、CSS 头部 > 8 KiB 2×2）；部分内容 99,470 字节，单封最多 8,192；Ready 15 / NoText 3 / Unavailable 2 / Failed 0 |
 
 第 1–6 行在本次修复前后完全相同（普通邮件纯文本可用时仍是每封一次 4 KiB 请求）。
+统一收件箱（第 10 节）之后，账号 rw 的 20 封邮件放在它自己服务器的 `INBOX` 中（预览只针对首页可见的 INBOX）；命令数、部分下载次数与字节完全相同，总字节比之前（文件夹名 `RealWorld`）少 65 字节，只是 `EXAMINE` 等响应中的文件夹名与 UID 状态不同。
 
 ### 9.7 预览诊断（脱敏）
 
@@ -260,15 +295,40 @@ GitHub 一行中的 ⑦⑧⑨ 是根据代码路径与 Gmail 的已知行为推�
 - 有用性判断（`IsUseful`）是保守的套话 / 链接识别，只决定是否值得用第二次请求；完整读完后只剩套话的邮件仍会显示这些文字。
 - 摘要中保留隐藏的 preheader（与 Gmail 等客户端一致）；若发件方把无关文字放在隐藏元素中，摘要也会显示它。
 
-## 10. 后续事项（不在 PR3 中修改代码）
+## 10. 默认首页：统一收件箱（Unified Inbox）
 
-### 10.1 Gmail 已归档 / 已删除邮件出现在首页列表
+### 10.1 问题与根因（Windows 实测反馈，issue [#4](https://github.com/zzvw/KeeprawMail/issues/4)）
 
-- **现象**：Gmail 账号中已归档（不在收件箱）和已删除（`[Gmail]/Trash`）的邮件也出现在首页列表中。
-- **原因**：同步覆盖 Inbox、Sent、Drafts、Trash、Junk、Archive（`ImapService` 中按 SPECIAL-USE 查找），而首页默认列表（`EmailStore.GetRecentAsync` / 每账号最近 100 封）**不按文件夹过滤**，因此 Trash、Junk、Sent 等文件夹的邮件与收件箱混在一起；预览候选使用同一查询，也会为这些文件夹生成预览。
-- **建议**：
-  1. 首页默认显示**多账号的 Inbox**（各账号服务器返回的收件箱，Gmail 为 `INBOX`），列表查询与预览候选同时加上文件夹条件；
-  2. 其它文件夹的数据继续同步、保留在本地，之后通过独立的文件夹入口访问（文件夹导航 / 筛选），不删除任何已同步的数据；
-  3. 预览候选范围随首页一起改为“当前显示的列表”，避免为不可见的文件夹消耗预览请求。
-- **需要评估**：在 Gmail 网页端归档一封邮件后，它从 `INBOX` 中移除（UID 消失），但本地 Inbox 记录要等下一次 UID 全量核对（Gmail 支持 CONDSTORE 但不支持 QRESYNC，间隔 6 小时，见第 5 节）才会删除；在此之前它仍显示在收件箱中，预览也会得到 `uid_missing`（Failed，退避）。可考虑：对 Inbox 缩短核对间隔、在预览得到 `uid_missing` 时提前触发该文件夹的 UID 核对，或使用 Gmail 的 `X-GM-LABELS` / `X-GM-MSGID` 识别归档。
-- PR3 不做文件夹管理重构；本事项在 GitHub issue [#4](https://github.com/zzvw/KeeprawMail/issues/4) 跟踪。
+- **Gmail 同一邮件显示两次**：同步覆盖 `INBOX`、Sent、Drafts、Trash、Junk、Archive（`ImapService.GetFoldersToSyncAsync`，按 SPECIAL-USE 查找；Gmail 不标记 `\Archive`，`[Gmail]/All Mail` 不在同步列表中）。本地每个文件夹的每个 UID 是一行，主键 `Id = AccountId|Mailbox|UID`（`EmailIdentity`），同一文件夹内同一 UID 不可能写入两行（UPSERT）。而 `EmailStore.GetRecentAsync()`（`DatabaseContext.GetEmailsAsync()` → `MainViewModel.LoadLocalEmailsAsync()`）**不按文件夹过滤**，因此用户发给自己的测试邮件（`INBOX` 与 `[Gmail]/Sent Mail` 各一份，主题 / 发件人 / 时间 / 摘要相同，UID 与 Id 不同）显示两次；如果 All Mail 等其它文件夹的数据存在，也会以同样方式重复。这不是同步重复写入，也不是同一文件夹内的重复邮件。
+- **归档 / 垃圾箱邮件出现在首页**：同一原因（Trash / Junk 等文件夹混在列表中），加上归档后 INBOX 记录滞留到 6 小时全量核对（第 5.1 节已解决）。
+- **预览浪费**：PR3 的预览候选使用同一个不过滤的查询，会为 Trash / Sent 等不应显示的邮件生成预览。
+
+### 10.2 规则
+
+- 首页 = 所有已配置账号的服务器收件箱 `INBOX`（`EmailStore.DefaultListFilterSql`：`Mailbox = 'INBOX' COLLATE NOCASE`）。RFC 3501 规定 `INBOX` 不区分大小写，因此 `Inbox` / `inbox` 也匹配；条件只与字面量 `INBOX` 比较，`INBOX/子文件夹`、`[Gmail]/All Mail` 等其它名称**不做大小写折叠**；`MailboxSyncState.MailboxName` 仍按 BINARY 比较。
+- 每账号最多最近 100 封（`ROW_NUMBER() OVER (PARTITION BY AccountId …)` 在 INBOX 过滤**之后**编号，其它文件夹的新邮件不会把 INBOX 挤出前 100，小账号也不会被大账号挤掉）。
+- 首页列表（`GetRecentAsync`）与预览候选（`GetPreviewCandidatesAsync`）共用同一个数据源 `EmailStore.DefaultListSourceSql`，外层只追加各自条件；隐藏文件夹的邮件永远不是预览候选，不产生预览流量（只有 Pending 的隐藏邮件时不会建立预览连接）。
+- 排序按**真实时刻**：`ORDER BY julianday(Date) DESC, Date DESC, Id DESC`。`Date` 以 ISO 8601 往返格式保存并保留原始偏移（Gmail INTERNALDATE 为 `+00:00`，QQ 等为 `+08:00`），按文本排序时不同偏移的邮件会错位（`21:30+08:00` 实际早于 `14:00+00:00`）；`julianday()` 把它们换算到同一时间轴。存储格式、解析与游标不变。
+- 不删除、不合并任何记录：Sent / Drafts / Trash / Junk / Archive 的邮件继续同步并保存（游标、正文缓存、预览状态、FTS 都不变），将来通过文件夹导航访问。不做基于主题 / 时间 / 发件人的去重：同一文件夹内主题、发件人、时间都相同的不同 UID 是不同邮件，照常分别显示。
+- 不需要数据库迁移（结构版本仍为 5）；已有数据库直接打开即按新规则显示。
+
+### 10.3 测试
+
+`UnifiedInboxTests`（Gmail 同一邮件在 INBOX / Sent Mail / All Mail 只显示一次且三行都保留；两账号 INBOX 各自 100 封、不被 Sent 挤出；Trash / Spam / Archive / Junk / Drafts 不进首页但行、正文缓存、FTS、游标保留；INBOX 大小写；内容相同的不同邮件不合并；列表与预览候选同一集合且隐藏文件夹不预览；混合偏移按真实时刻排序；已有数据库重新打开不丢数据），`InboxArchiveReconcileTests`（归档 / 移入垃圾箱后一次手动同步即更新首页、请求数、自发邮件只删 INBOX 行、归档与新邮件同时发生、无 CONDSTORE 服务器、对照 PR3 行为、归档后不再预览），`ArchiveReconcileMetricsTests`（实测流量）。
+
+## 11. 本地时间显示
+
+- **问题**：Windows 时区为北京时间时，北京时间 22:00 收到的 Gmail 邮件在列表中显示 14:00。Gmail 的 INTERNALDATE 带 `+0000`，原样以 `+00:00` 保存；`EmailMessage.DisplayDate` / `FullDateTooltip` 直接对保存的 `DateTimeOffset` 调用 `ToString("HH:mm")`，显示的是邮件自带偏移下的钟点，而不是本地时间。
+- **做法**：所有用户可见的邮件时间统一经过 `Core.Formatting.MailDateFormatter`：`TimeZoneInfo.ConvertTime(value, zone)` 换算到本地时区后再格式化。默认实例 `MailDateFormatter.System` 每次读取 `TimeZoneInfo.Local`（Windows 当前系统时区，不硬编码 UTC+8），测试注入 `TimeZoneInfo` 与 `TimeProvider`。
+  - 列表 `DisplayDate`：本地今天 ⇒ `HH:mm`；本地昨天 ⇒ “昨天”；2–6 天前 ⇒ 星期（按区域格式）；同一年 ⇒ `MM-dd`；更早 ⇒ `yyyy-MM-dd`。“今天 / 昨天”按**本地日历日期**判断（午夜跨日、夏令时 23 / 25 小时的日子都正确），不再按相差小时数。
+  - 完整时间 `FullDateTooltip`（列表 ToolTip）、阅读器头部 `Date:`、回复 / 转发引用中的“日期:”：`yyyy-MM-dd HH:mm:ss` 本地时间。
+  - `DateTimeToStringConverter`（App.xaml 中注册的资源）与列表使用同一规则。
+- **切换时区**：.NET 在进程内缓存 `TimeZoneInfo.Local`；每次重新加载列表（启动、同步完成）前调用 `MailDateFormatter.RefreshSystemTimeZone()`（`TimeZoneInfo.ClearCachedData()`），因此在 Windows 中切换时区后点一次“同步”即按新时区显示。
+- **不变**：数据库中的绝对时间与偏移、IMAP 日期解析（INTERNALDATE 优先、ENVELOPE Date 回退）、同步游标、存储格式；列表排序按真实时刻（第 10.2 节），与显示时区无关。
+- **已知限制**：列表项的显示文本在绑定时计算，应用一直开着跨过本地午夜时，“今天 / 昨天”要到下一次刷新列表（同步）才更新。
+- **测试**：`MailDateFormatterTests`（报告中的 22:00 / 14:00 问题、UTC、UTC+8、切换到美国时区 UTC-7 / UTC-8 / UTC-4、洛杉矶春秋两次夏令时切换与自定义规则、北京与洛杉矶午夜跨日、秋季回拨当天的“昨天”、星期 / 月日 / 跨年、未知日期不抛异常、排序与显示时区无关、系统时区）。
+
+## 12. 后续事项
+
+- 文件夹导航 / 筛选界面（访问 Sent、Trash、Archive 等已同步的数据）不在本 PR 中实现；数据已在本地保留，`DefaultListSourceSql` 之外的查询可以直接复用 `ListOrderSql`。
+- FTS5 搜索界面仍未接入（`SearchAsync` 仍是 TODO），本 PR 不修改。
