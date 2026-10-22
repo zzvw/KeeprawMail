@@ -113,8 +113,16 @@ public sealed class MailPreviewService
     /// <summary>取消所有进行中的预览（应用退出时）。</summary>
     public void CancelAll() => _shutdown.Cancel();
 
+    /// <summary>测试钩子：每轮结束后、在锁内做“是否再跑一轮”判断之前调用（不在锁内等待）。</summary>
+    internal Func<string, Task>? TestHookBeforeEndCheck { get; set; }
+
+    /// <summary>测试钩子：循环已决定结束且 Runner 已从字典移除之后、Completion 完成之前调用（不在锁内等待）。</summary>
+    internal Func<string, Task>? TestHookAfterExitDecision { get; set; }
+
     private async Task LoopAsync(string accountId, Runner runner)
     {
+        // removed 只由本循环读写；为 true 表示已在“是否再跑一轮”的同一把锁内把 Runner 移出字典
+        var removed = false;
         try
         {
             while (true)
@@ -123,7 +131,7 @@ public sealed class MailPreviewService
                 {
                     await RunOnceAsync(accountId, _shutdown.Token).ConfigureAwait(false);
                 }
-                catch (OperationCanceledException)
+                catch (OperationCanceledException) when (_shutdown.IsCancellationRequested)
                 {
                     break;
                 }
@@ -131,22 +139,48 @@ public sealed class MailPreviewService
                 {
                     _log?.Invoke($"preview run crashed for {accountId}: {ex.GetType().Name}: {DiagnosticLog.Redact(ex.Message)}");
                 }
+
+                if (TestHookBeforeEndCheck is { } beforeCheck)
+                    await beforeCheck(accountId).ConfigureAwait(false);
+
+                // 结束边界：“是否再跑一轮”的判断与从字典移除 Runner 必须在同一把锁内原子完成。
+                // 否则判断 Again == false 之后、移除之前到达的 RequestAsync 会把 Again 设到即将结束的 Runner 上而丢失。
+                // 现在任意时刻到达的请求要么被本循环看到（再跑一轮），要么找不到 Runner 而启动新的 Runner。
                 lock (_gate)
                 {
-                    if (!runner.Again) break;
-                    runner.Again = false;
+                    if (runner.Again)
+                    {
+                        runner.Again = false;
+                    }
+                    else
+                    {
+                        RemoveRunnerLocked(accountId, runner);
+                        removed = true;
+                    }
                 }
+                if (removed) break;
             }
         }
         finally
         {
-            lock (_gate)
+            // 取消（或意外异常）路径：移除仍属于本循环的 Runner；之后到达的请求会启动新的 Runner
+            if (!removed)
             {
-                if (_running.TryGetValue(accountId, out var current) && ReferenceEquals(current, runner))
-                    _running.Remove(accountId);
+                lock (_gate) RemoveRunnerLocked(accountId, runner);
             }
-            runner.Completion.TrySetResult();
+            if (TestHookAfterExitDecision is { } afterExit)
+            {
+                try { await afterExit(accountId).ConfigureAwait(false); }
+                catch (Exception ex) { _log?.Invoke($"preview test hook failed: {ex.GetType().Name}"); }
+            }
+            runner.Completion.TrySetResult(); // RunContinuationsAsynchronously，且不在锁内
         }
+    }
+
+    private void RemoveRunnerLocked(string accountId, Runner runner)
+    {
+        if (_running.TryGetValue(accountId, out var current) && ReferenceEquals(current, runner))
+            _running.Remove(accountId);
     }
 
     /// <summary>执行一轮预览（不合并，测试可直接调用）。取消时抛出 <see cref="OperationCanceledException"/>，已写入的批次保留。</summary>
