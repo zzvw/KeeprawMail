@@ -27,6 +27,11 @@ namespace KeeprawMail.ViewModels
             // 在 UI 线程上构造：后台预览任务的结果通过它回到 UI 线程更新列表项
             _uiContext = System.Threading.SynchronizationContext.Current;
             Emails = new ObservableCollection<EmailMessage>();
+            // 列表增删（含删除命令）后刷新搜索空状态 / “加载更多”的可见性
+            Emails.CollectionChanged += (_, _) =>
+            {
+                if (_listMode != ListMode.Inbox && !_searchRunning) RaiseSearchUiChanged();
+            };
             
             // 从数据库加载邮件
             _ = LoadLocalEmailsAsync();
@@ -77,36 +82,58 @@ namespace KeeprawMail.ViewModels
         private string statusMessage = "Ready";
 
         /// <summary>
-        /// 从数据库加载本地邮件
+        /// 从数据库重新加载账号与当前列表：默认首页时加载统一收件箱；搜索状态下保留搜索关键词并重新执行本地搜索（不会悄悄跳回收件箱）。
+        /// 同步结束、设置页删除 / 修改账号后都调用这里。
         /// </summary>
         /// <param name="updateStatus">
         /// 为 false 时不改写状态栏：同步结束后重载列表，不能用“已加载 N 封邮件”覆盖刚产生的同步错误。
         /// </param>
         public async Task LoadLocalEmailsAsync(bool updateStatus = true)
         {
-            try 
+            try
             {
-                // 1. 加载账号
                 var localAccounts = await _databaseContext.GetAccountsAsync();
                 Accounts.Clear();
                 foreach (var account in localAccounts)
                 {
                     Accounts.Add(account);
                 }
+            }
+            catch (System.Exception ex)
+            {
+                StatusMessage = $"加载失败: {ex.Message}";
+                System.Diagnostics.Debug.WriteLine($"LoadLocalEmailsAsync Error: {ex}");
+                return;
+            }
 
-                // 2. 加载邮件（默认首页 = 所有账号的 INBOX，每账号最近 100 封，按真实时间倒序）
-                //    重新读取 Windows 系统时区：用户切换时区后，刷新列表即按新时区显示时间
+            switch (_listMode)
+            {
+                case ListMode.Search when _activeSearch != null:
+                    await RunSearchAsync(_activeSearch, KeepLoadedSearchCount(), updateStatus);
+                    break;
+                case ListMode.SearchError:
+                    break; // 保持输入错误提示与空列表，等待用户修改搜索内容
+                default:
+                    await LoadInboxAsync(updateStatus);
+                    break;
+            }
+        }
+
+        /// <summary>
+        /// 加载默认首页（统一收件箱：所有账号的 INBOX，每账号最近 100 封，按真实时间倒序）。
+        /// 经过 <see cref="_listLoads"/>：若加载期间用户开始了搜索，这次（较旧的）结果被丢弃，不会覆盖搜索结果。
+        /// </summary>
+        private async Task LoadInboxAsync(bool updateStatus)
+        {
+            try
+            {
+                // 重新读取 Windows 系统时区：用户切换时区后，刷新列表即按新时区显示时间
                 Core.Formatting.MailDateFormatter.RefreshSystemTimeZone();
-                var localEmails = await _databaseContext.GetEmailsAsync();
-                Emails.Clear();
-                foreach (var email in localEmails)
-                {
-                    // 读库期间后台预览刚写入的结果：补到新列表项上（否则会被读到的旧状态覆盖）
-                    if (_recentPreviewUpdates.TryGetValue(email.Id, out var update) && email.PreviewState is not Core.Storage.PreviewState.Ready)
-                        ApplyPreview(email, update);
-                    Emails.Add(email);
-                }
-                _recentPreviewUpdates.Clear();
+                var result = await _listLoads.RunAsync(ct => Task.Run(() => _databaseContext.GetEmailsAsync(ct), ct));
+                if (!result.IsCurrent || !_listLoads.IsCurrentVersion(result.Version) || _listMode != ListMode.Inbox)
+                    return;
+
+                ReplaceEmails(result.Value!, labelLocation: false);
 
                 // 启动后第一次加载列表：为列表中的每个账号安排一次后台预览（不阻塞界面，失败不影响列表）。
                 // 没有 Pending / 到期 Failed 的账号不会建立任何连接；旧算法留下的“有正文缓存的 NoText”在这一轮从本地缓存重算（零网络，只做一次）。
@@ -116,16 +143,49 @@ namespace KeeprawMail.ViewModels
                     foreach (var accountId in Emails.Select(e => e.AccountId).Distinct().ToList())
                         SchedulePreviews(accountId);
                 }
-                
+
                 if (updateStatus)
                     StatusMessage = Data.DatabaseContext.CredentialMigrationNotice ?? $"已加载 {Emails.Count} 封邮件到列表";
-                System.Diagnostics.Debug.WriteLine($"LoadLocalEmailsAsync: 加载了 {Emails.Count} 封邮件");
+                System.Diagnostics.Debug.WriteLine($"LoadInboxAsync: 加载了 {Emails.Count} 封邮件");
             }
             catch (System.Exception ex)
             {
                 StatusMessage = $"加载失败: {ex.Message}";
-                System.Diagnostics.Debug.WriteLine($"LoadLocalEmailsAsync Error: {ex}");
+                System.Diagnostics.Debug.WriteLine($"LoadInboxAsync Error: {ex}");
             }
+            finally
+            {
+                RaiseSearchUiChanged();
+            }
+        }
+
+        /// <summary>
+        /// 用新结果替换列表（UI 线程）。读库期间后台预览刚写入的结果补到新列表项上（否则会被读到的旧状态覆盖）。
+        /// </summary>
+        private void ReplaceEmails(System.Collections.Generic.IReadOnlyList<EmailMessage> items, bool labelLocation)
+        {
+            Emails.Clear();
+            foreach (var email in items)
+            {
+                ApplyRecentPreview(email);
+                email.LocationLabel = labelLocation ? LocationLabelFor(email) : string.Empty;
+                Emails.Add(email);
+            }
+            _recentPreviewUpdates.Clear();
+        }
+
+        private void ApplyRecentPreview(EmailMessage email)
+        {
+            if (_recentPreviewUpdates.TryGetValue(email.Id, out var update) && email.PreviewState is not Core.Storage.PreviewState.Ready)
+                ApplyPreview(email, update);
+        }
+
+        /// <summary>“账号邮箱 · 文件夹”；账号已不存在时显示账号 ID。</summary>
+        private string LocationLabelFor(EmailMessage email)
+        {
+            var account = Accounts.FirstOrDefault(a => a.Id == email.AccountId);
+            var name = account != null && !string.IsNullOrEmpty(account.Email) ? account.Email : email.AccountId;
+            return $"{name} · {EmailMessage.MailboxDisplayName(email.Mailbox)}";
         }
 
         /// <summary>同步出现失败（含部分失败）时触发，界面据此弹出详细说明。</summary>
@@ -362,24 +422,208 @@ namespace KeeprawMail.ViewModels
             return result;
         }
 
-        /// <summary>
-        /// 执行搜索
-        /// </summary>
-        [RelayCommand]
-        private async Task SearchAsync()
+        // ---- 本地邮件搜索（实现见 KeeprawMail.Core.Search.MailSearchQuery / Core.Storage.EmailStore.SearchAsync）----
+        //
+        // 列表有三种状态：默认首页（统一收件箱）/ 搜索结果 / 搜索输入错误。搜索只读本地 SQLite，不连接邮件服务器、不下载正文或附件。
+        // 收件箱加载、搜索、加载更多都经过同一个 LatestOnlyRunner：新请求开始时取消并作废旧请求，旧结果即使晚到也不会覆盖新结果。
+
+        private enum ListMode { Inbox, Search, SearchError }
+
+        private readonly Core.Search.LatestOnlyRunner _listLoads = new();
+        private ListMode _listMode = ListMode.Inbox;
+        private Core.Search.MailSearchQuery? _activeSearch;
+        private int _searchTotal;
+        private bool _searchRunning;
+        private string _searchMessage = string.Empty;
+        private bool _clearingSearch;
+
+        /// <summary>每次加载的搜索结果数（“加载更多”每次追加同样数量）。</summary>
+        public const int SearchPageSize = Core.Storage.EmailStore.DefaultSearchPageSize;
+
+        /// <summary>当前是否显示搜索结果（含搜索输入错误提示）。</summary>
+        public bool IsSearchActive => _listMode != ListMode.Inbox;
+
+        /// <summary>列表上方的搜索结果说明：共几封、已显示几封、或输入错误 / 搜索失败的提示。</summary>
+        public string SearchSummary => _searchMessage;
+
+        public Microsoft.UI.Xaml.Visibility SearchBannerVisibility =>
+            _listMode != ListMode.Inbox ? Microsoft.UI.Xaml.Visibility.Visible : Microsoft.UI.Xaml.Visibility.Collapsed;
+
+        /// <summary>搜索没有匹配结果（或输入无法搜索）时的空状态，避免旧结果造成误解。</summary>
+        public Microsoft.UI.Xaml.Visibility SearchEmptyVisibility =>
+            _listMode != ListMode.Inbox && !_searchRunning && Emails.Count == 0 ? Microsoft.UI.Xaml.Visibility.Visible : Microsoft.UI.Xaml.Visibility.Collapsed;
+
+        public string SearchEmptyText => _listMode == ListMode.SearchError
+            ? "无法搜索：请修改搜索内容后按 Enter。"
+            : "没有找到匹配的邮件。\n搜索范围：已同步到本机的主题、发件人和邮件摘要（不含未下载的完整正文和附件）。";
+
+        public Microsoft.UI.Xaml.Visibility LoadMoreVisibility =>
+            _listMode == ListMode.Search && !_searchRunning && Emails.Count < _searchTotal ? Microsoft.UI.Xaml.Visibility.Visible : Microsoft.UI.Xaml.Visibility.Collapsed;
+
+        public Microsoft.UI.Xaml.Visibility SearchProgressVisibility =>
+            _searchRunning ? Microsoft.UI.Xaml.Visibility.Visible : Microsoft.UI.Xaml.Visibility.Collapsed;
+
+        private void RaiseSearchUiChanged()
         {
-            if (string.IsNullOrWhiteSpace(SearchQuery))
+            OnPropertyChanged(nameof(IsSearchActive));
+            OnPropertyChanged(nameof(SearchSummary));
+            OnPropertyChanged(nameof(SearchBannerVisibility));
+            OnPropertyChanged(nameof(SearchEmptyVisibility));
+            OnPropertyChanged(nameof(SearchEmptyText));
+            OnPropertyChanged(nameof(LoadMoreVisibility));
+            OnPropertyChanged(nameof(SearchProgressVisibility));
+        }
+
+        /// <summary>搜索框被清空（含点击搜索框的 × 按钮）时恢复统一收件箱；输入过程中不会自动搜索，按 Enter 才搜索。</summary>
+        partial void OnSearchQueryChanged(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value) && _listMode != ListMode.Inbox && !_clearingSearch)
+                _ = ClearSearchAsync();
+        }
+
+        /// <summary>执行搜索（按 Enter / 点击搜索图标）。空白内容等同于清除搜索。</summary>
+        [RelayCommand]
+        private Task SearchAsync() => SubmitSearchAsync(SearchQuery);
+
+        /// <summary>提交一次搜索：解析 → 本地 SQLite 查询第一页。</summary>
+        public async Task SubmitSearchAsync(string? text)
+        {
+            if (!Core.Search.MailSearchQuery.TryParse(text, out var query, out var error))
             {
-                await LoadLocalEmailsAsync();
+                if (error == null)
+                {
+                    await ClearSearchAsync();
+                    return;
+                }
+                // 无法搜索的输入：显示友好提示并清空列表（不保留旧结果，不显示 SQLite 原始错误）
+                ShowSearchError(error);
                 return;
             }
 
-            StatusMessage = $"Searching for '{SearchQuery}'...";
-            // TODO: 调用 DatabaseContext 执行 FTS5 搜索
-            // 目前 MVP 暂未实现 FTS5 查询方法，先保留
-            await Task.Delay(500);
-            StatusMessage = "Search completed";
+            _listMode = ListMode.Search;
+            _activeSearch = query;
+            await RunSearchAsync(query!, SearchPageSize, updateStatus: true);
         }
+
+        /// <summary>同步 / 账号变化后重新执行当前搜索时保留已加载的数量（不超过单次上限）。</summary>
+        private int KeepLoadedSearchCount() =>
+            System.Math.Clamp(System.Math.Max(SearchPageSize, Emails.Count), 1, Core.Storage.EmailStore.MaxSearchPageSize);
+
+        private async Task RunSearchAsync(Core.Search.MailSearchQuery query, int limit, bool updateStatus)
+        {
+            _searchRunning = true;
+            RaiseSearchUiChanged();
+            if (updateStatus) StatusMessage = $"正在本地搜索“{query.RawText}”…";
+            try
+            {
+                var result = await _listLoads.RunAsync(ct => Task.Run(() => _databaseContext.SearchEmailsAsync(query, limit, 0, ct), ct));
+                if (!result.IsCurrent || !_listLoads.IsCurrentVersion(result.Version) || !ReferenceEquals(_activeSearch, query) || _listMode != ListMode.Search)
+                    return; // 已被更新的搜索 / 清除搜索取代
+
+                var (items, total) = result.Value;
+                ReplaceEmails(items, labelLocation: true);
+                _searchTotal = total;
+                _searchRunning = false;
+                _searchMessage = DescribeSearch(query, Emails.Count, total);
+                if (updateStatus) StatusMessage = total == 0 ? $"没有找到与“{query.RawText}”匹配的邮件" : $"本地搜索完成：共 {total} 封";
+            }
+            catch (System.Exception ex)
+            {
+                if (!ReferenceEquals(_activeSearch, query)) return;
+                FailSearch(ex);
+            }
+            finally
+            {
+                if (ReferenceEquals(_activeSearch, query)) _searchRunning = false;
+                RaiseSearchUiChanged();
+            }
+        }
+
+        /// <summary>加载更多搜索结果（追加下一页；按 Id 去重，同步插入新邮件导致的偏移不会产生重复行）。</summary>
+        [RelayCommand]
+        private async Task LoadMoreSearchResultsAsync()
+        {
+            if (_listMode != ListMode.Search || _activeSearch == null || _searchRunning) return;
+            var query = _activeSearch;
+            var offset = Emails.Count;
+            _searchRunning = true;
+            RaiseSearchUiChanged();
+            try
+            {
+                var result = await _listLoads.RunAsync(ct => Task.Run(() => _databaseContext.SearchEmailsAsync(query, SearchPageSize, offset, ct), ct));
+                if (!result.IsCurrent || !_listLoads.IsCurrentVersion(result.Version) || !ReferenceEquals(_activeSearch, query) || _listMode != ListMode.Search)
+                    return;
+                var (items, total) = result.Value;
+                var existing = new System.Collections.Generic.HashSet<string>(Emails.Select(e => e.Id));
+                foreach (var email in items)
+                {
+                    if (!existing.Add(email.Id)) continue;
+                    ApplyRecentPreview(email);
+                    email.LocationLabel = LocationLabelFor(email);
+                    Emails.Add(email);
+                }
+                _searchTotal = total;
+                _searchRunning = false;
+                _searchMessage = DescribeSearch(query, Emails.Count, total);
+                StatusMessage = $"已显示 {Emails.Count} / {total} 封";
+            }
+            catch (System.Exception ex)
+            {
+                if (!ReferenceEquals(_activeSearch, query)) return;
+                FailSearch(ex);
+            }
+            finally
+            {
+                if (ReferenceEquals(_activeSearch, query)) _searchRunning = false;
+                RaiseSearchUiChanged();
+            }
+        }
+
+        /// <summary>清除搜索，恢复默认首页（统一收件箱，仅 INBOX）。正在进行的搜索被作废。</summary>
+        [RelayCommand]
+        public async Task ClearSearchAsync()
+        {
+            _listLoads.Invalidate();
+            _listMode = ListMode.Inbox;
+            _activeSearch = null;
+            _searchTotal = 0;
+            _searchRunning = false;
+            _searchMessage = string.Empty;
+            if (!string.IsNullOrEmpty(SearchQuery))
+            {
+                _clearingSearch = true;
+                try { SearchQuery = string.Empty; }
+                finally { _clearingSearch = false; }
+            }
+            RaiseSearchUiChanged();
+            await LoadInboxAsync(updateStatus: true);
+        }
+
+        private void ShowSearchError(string message)
+        {
+            _listLoads.Invalidate();
+            _listMode = ListMode.SearchError;
+            _activeSearch = null;
+            _searchTotal = 0;
+            _searchRunning = false;
+            _searchMessage = message;
+            Emails.Clear();
+            StatusMessage = message;
+            RaiseSearchUiChanged();
+        }
+
+        /// <summary>搜索失败：如实提示并清空列表（不显示假成功，也不保留上一次的结果）。</summary>
+        private void FailSearch(System.Exception ex)
+        {
+            var message = ex is Core.Search.MailSearchException mse ? mse.Message : "搜索失败：读取本地邮件数据库时出错，请稍后重试。";
+            DiagnosticLog.Write("search", $"search failed: {ex.GetType().Name}: {ex.Message}");
+            ShowSearchError(message);
+        }
+
+        private static string DescribeSearch(Core.Search.MailSearchQuery query, int shown, int total) =>
+            total == 0 ? $"“{query.RawText}”：没有匹配的邮件"
+            : shown < total ? $"“{query.RawText}”：共 {total} 封，已显示最新的 {shown} 封"
+            : $"“{query.RawText}”：共 {total} 封";
 
         /// <summary>
         /// 删除选中邮件

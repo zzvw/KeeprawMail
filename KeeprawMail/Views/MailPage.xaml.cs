@@ -32,7 +32,7 @@ namespace KeeprawMail.Views
             
             // 手动同步邮件列表 (绕过 Native AOT ItemsSource 问题)
             SyncEmailList();
-            ViewModel.Emails.CollectionChanged += (s, e) => SyncEmailList();
+            ViewModel.Emails.CollectionChanged += OnEmailsCollectionChanged;
             ViewModel.SyncFinishedWithProblems += OnSyncFinishedWithProblems;
             this.Unloaded += (s, e) => ViewModel.SyncFinishedWithProblems -= OnSyncFinishedWithProblems;
         }
@@ -59,6 +59,55 @@ namespace KeeprawMail.Views
             {
                 EmailListView.Items.Add(email);
             }
+        }
+
+        /// <summary>
+        /// 增量同步列表项：添加 / 删除只改动对应的项（加载 200 封搜索结果时不再每加一封就整表重建），其它变化整表重建。
+        /// 任何不一致时回退为整表重建，保证列表与 ViewModel.Emails 完全一致（不会残留旧搜索结果）。
+        /// </summary>
+        private void OnEmailsCollectionChanged(object? sender, System.Collections.Specialized.NotifyCollectionChangedEventArgs e)
+        {
+            var items = EmailListView.Items;
+            switch (e.Action)
+            {
+                case System.Collections.Specialized.NotifyCollectionChangedAction.Add
+                    when e.NewItems != null && e.NewStartingIndex >= 0 && e.NewStartingIndex <= items.Count:
+                    for (var i = 0; i < e.NewItems.Count; i++)
+                        items.Insert(e.NewStartingIndex + i, e.NewItems[i]);
+                    break;
+                case System.Collections.Specialized.NotifyCollectionChangedAction.Remove
+                    when e.OldItems != null && e.OldStartingIndex >= 0 && e.OldStartingIndex + e.OldItems.Count <= items.Count:
+                    for (var i = 0; i < e.OldItems.Count; i++)
+                        items.RemoveAt(e.OldStartingIndex);
+                    break;
+                default:
+                    SyncEmailList();
+                    return;
+            }
+            if (items.Count != ViewModel.Emails.Count)
+                SyncEmailList();
+        }
+
+        /// <summary>按 Enter 或点击搜索图标：在本地数据库中搜索（不连接邮件服务器）。</summary>
+        private async void SearchBox_QuerySubmitted(AutoSuggestBox sender, AutoSuggestBoxQuerySubmittedEventArgs args)
+        {
+            try
+            {
+                await ViewModel.SubmitSearchAsync(args.QueryText);
+            }
+            catch (Exception ex)
+            {
+                // ViewModel 已处理所有已知错误；这里只是保底，避免 async void 让应用崩溃
+                DiagnosticLog.Write("search", $"submit crashed: {ex.GetType().Name}");
+                ViewModel.StatusMessage = "搜索失败，请重试。";
+            }
+        }
+
+        /// <summary>Ctrl+E：聚焦搜索框并选中已有内容。</summary>
+        private void FocusSearch_Invoked(Microsoft.UI.Xaml.Input.KeyboardAccelerator sender, Microsoft.UI.Xaml.Input.KeyboardAcceleratorInvokedEventArgs args)
+        {
+            args.Handled = true;
+            SearchBox.Focus(FocusState.Keyboard);
         }
 
         /// <summary>
@@ -510,18 +559,19 @@ namespace KeeprawMail.Views
                         System.Diagnostics.Debug.WriteLine($"[MailPage] ✓ 数据库更新成功: ID={email.Id}, IsStarred={isStarred}");
                     }
 
-                    // 2. 更新 IMAP
-                    if (ViewModel.SelectedAccount != null)
+                    // 2. 更新 IMAP：按邮件所属账号连接（搜索结果可能来自非当前选中的账号，不能用 SelectedAccount）
+                    var account = ViewModel.Accounts.FirstOrDefault(a => a.Id == email.AccountId);
+                    if (account != null)
                     {
                         // 这是一个异步操作，但不阻塞 UI
                         _ = System.Threading.Tasks.Task.Run(async () =>
                         {
                             try
                             {
-                                System.Diagnostics.Debug.WriteLine($"[MailPage] 准备连接 IMAP 服务器同步星标: Account={ViewModel.SelectedAccount.Email}");
-                                using (var imap = new Services.ImapService(ViewModel.SelectedAccount))
+                                System.Diagnostics.Debug.WriteLine($"[MailPage] 准备连接 IMAP 服务器同步星标: Account={account.Email}");
+                                using (var imap = new Services.ImapService(account))
                                 {
-                                    await imap.ConnectAsync(ViewModel.SelectedAccount);
+                                    await imap.ConnectAsync(account);
                                     await imap.ToggleFlagAsync(email.Mailbox, email.Id, isStarred);
                                     System.Diagnostics.Debug.WriteLine($"[MailPage] ✓ 星标同步成功: ID={email.Id}");
                                 }
@@ -540,7 +590,7 @@ namespace KeeprawMail.Views
                     }
                     else
                     {
-                        System.Diagnostics.Debug.WriteLine($"[MailPage] ⚠ 未选择账号，跳过 IMAP 星标同步");
+                        System.Diagnostics.Debug.WriteLine($"[MailPage] ⚠ 找不到邮件所属账号，跳过 IMAP 星标同步");
                     }
                 }
                 catch (Exception ex)
