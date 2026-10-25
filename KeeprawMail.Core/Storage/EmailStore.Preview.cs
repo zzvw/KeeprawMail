@@ -23,7 +23,8 @@ public sealed record AppliedPreview(string EmailId, string AccountId, PreviewSta
 
 /// <summary>
 /// 列表预览的读写。规则：
-///  * 候选与列表使用同一查询规则：每个账号按 Date 倒序的前 N 封（N 与列表相同，默认 100），不是整个邮箱历史；
+///  * 候选与列表使用同一查询规则（<c>DefaultListSourceSql</c>）：每个账号 INBOX 按真实时间倒序的前 N 封（N 与列表相同，默认 100），
+///    不是整个邮箱历史，也不包含首页不显示的文件夹（Sent / Trash / Junk / Archive 等）；
 ///  * 只选 Pending，或 Failed 且已到重试时间的邮件；Ready、NoText、Unavailable 在当前算法下不再取；已缓存正文的邮件不是候选；
 ///  * 写入只更新 Snippet 与预览状态列：不清空 BodyLocalPath，不改已读 / 星标 / 主题 / 发件人 / UID，不触碰 MailboxSyncState（同步游标）；
 ///  * 写入前确认 UIDVALIDITY 与已保存的同步状态一致（文件夹被重建时 UID 可能指向另一封邮件），也不会覆盖已是 Ready 的行或已缓存正文的行。
@@ -31,24 +32,22 @@ public sealed record AppliedPreview(string EmailId, string AccountId, PreviewSta
 /// </summary>
 public sealed partial class EmailStore
 {
-    /// <summary>列表中（每账号前 <paramref name="perAccountLimit"/> 封）需要生成预览的邮件，按时间倒序（最新的优先）。</summary>
+    /// <summary>首页列表中（每账号 INBOX 前 <paramref name="perAccountLimit"/> 封）需要生成预览的邮件，按真实时间倒序（最新的优先）。</summary>
     public async Task<List<PreviewCandidate>> GetPreviewCandidatesAsync(string? accountId, int perAccountLimit, DateTimeOffset now, CancellationToken ct = default)
     {
         using var c = new SqliteConnection(Cs);
         await c.OpenAsync(ct).ConfigureAwait(false);
         using var cmd = c.CreateCommand();
-        // 内层查询与 GetRecentAsync 完全相同（PARTITION BY AccountId ORDER BY Date DESC），保证只取列表实际显示的邮件
-        cmd.CommandText = @"
-            SELECT Id, AccountId, Mailbox, ImapUid, Date, PreviewState, PreviewAttempts FROM (
-                SELECT Id, AccountId, Mailbox, ImapUid, Date, PreviewState, PreviewAttempts, PreviewNextRetryAt, BodyLocalPath,
-                       ROW_NUMBER() OVER (PARTITION BY AccountId ORDER BY Date DESC) AS rn
-                FROM Emails
+        // 数据源与 GetRecentAsync 完全相同（DefaultListSourceSql：INBOX 过滤 + 每账号按真实时间倒序前 N 封），保证只为首页实际显示的邮件取预览，
+        // 其它文件夹（Sent / Trash / Junk / Archive …）不会产生任何预览请求
+        cmd.CommandText = $@"
+            SELECT Id, AccountId, Mailbox, ImapUid, Date, PreviewState, PreviewAttempts FROM ({DefaultListSourceSql("Id, AccountId, Mailbox, ImapUid, Date, PreviewState, PreviewAttempts, PreviewNextRetryAt, BodyLocalPath")}
             ) WHERE rn <= $Limit
               AND ($A IS NULL OR AccountId = $A)
               AND ImapUid IS NOT NULL
               AND IFNULL(BodyLocalPath, '') = ''
               AND (PreviewState = 0 OR (PreviewState = 3 AND (PreviewNextRetryAt IS NULL OR PreviewNextRetryAt <= $Now)))
-            ORDER BY Date DESC";
+            ORDER BY {ListOrderSql}";
         cmd.Parameters.AddWithValue("$Limit", perAccountLimit);
         cmd.Parameters.AddWithValue("$A", (object?)accountId ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$Now", FormatUtc(now));

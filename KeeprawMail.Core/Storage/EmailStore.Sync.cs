@@ -283,6 +283,22 @@ public sealed partial class EmailStore
         return list;
     }
 
+    /// <summary>
+    /// 本地该文件夹中 UID ≤ <paramref name="maxUid"/> 的邮件数（只计有 UID 的行）。
+    /// 与 EXAMINE 返回的 EXISTS 比较：本地多于服务器 ⇒ 服务器上有邮件被移走（归档 / 移到其它文件夹 / 删除）。
+    /// </summary>
+    public async Task<long> CountLocalUidsAsync(string accountId, string mailboxName, uint maxUid, CancellationToken ct = default)
+    {
+        using var c = new SqliteConnection(Cs);
+        await c.OpenAsync(ct).ConfigureAwait(false);
+        using var cmd = c.CreateCommand();
+        cmd.CommandText = "SELECT COUNT(*) FROM Emails WHERE AccountId = $A AND Mailbox = $M AND ImapUid IS NOT NULL AND ImapUid <= $U";
+        cmd.Parameters.AddWithValue("$A", accountId);
+        cmd.Parameters.AddWithValue("$M", mailboxName);
+        cmd.Parameters.AddWithValue("$U", (long)maxUid);
+        return (long)(await cmd.ExecuteScalarAsync(ct).ConfigureAwait(false) ?? 0L);
+    }
+
     /// <summary>本地该文件夹 Id 无法解析出 UID 的旧行数量。</summary>
     public async Task<long> CountUnparsableAsync(string accountId, string mailboxName, CancellationToken ct = default)
     {

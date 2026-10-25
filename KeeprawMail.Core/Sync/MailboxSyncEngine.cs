@@ -22,6 +22,13 @@ public sealed record MailboxSyncOptions
 
     /// <summary>强制本次执行全量核对（例如用户手动“完整校验”）。</summary>
     public bool ForceFullReconcile { get; init; }
+
+    /// <summary>
+    /// 移出检测：每次增量同步把 EXAMINE 已返回的服务器邮件数（EXISTS，零额外请求）与本地游标以内的邮件数比较；
+    /// 本地更多 ⇒ 有邮件已离开该文件夹（如 Gmail 网页端归档、移入垃圾箱），立即做一次只取 UID 的移出核对（<c>UID SEARCH ALL</c>），
+    /// 不必等 <see cref="FullReconcileInterval"/>。计数一致时不发任何额外请求。默认开启；关闭只用于对比测量。
+    /// </summary>
+    public bool DetectRemovalsByCount { get; init; } = true;
 }
 
 public enum MailboxSyncPhase { Opening, Baseline, NewMessages, Flags, Reconcile, Done }
@@ -42,6 +49,8 @@ public sealed class MailboxSyncResult
     public int BodyCacheInvalidated { get; set; }
     public int BodyFilesDeleted { get; set; }
     public string FlagStrategy { get; set; } = "none";
+    /// <summary>本次因 EXISTS 少于本地邮件数而执行了只取 UID 的移出核对（见 <see cref="MailboxSyncOptions.DetectRemovalsByCount"/>）。</summary>
+    public bool RemovalCheckPerformed { get; set; }
 }
 
 /// <summary>
@@ -53,7 +62,8 @@ public sealed class MailboxSyncResult
 ///     每批元数据与游标同一事务提交（中断后从游标处继续，不重复插入）；
 ///  3. 有同步状态 ⇒ 只取 UID &gt; 游标的新邮件（UIDNEXT 表明没有新邮件时连 SEARCH 都不发）；
 ///  4. Flags：CONDSTORE 用 CHANGEDSINCE 只取变化（HIGHESTMODSEQ 未变则不发请求）；否则检查最近一段 UID 范围；
-///  5. 远端删除：QRESYNC 的 VANISHED 立即处理；否则按间隔做 UID-only 全量核对（并在无 CONDSTORE 时校正全部 Flags）。
+///  5. 远端删除 / 移出：QRESYNC 的 VANISHED 立即处理；EXAMINE 的 EXISTS 少于本地游标以内的邮件数时，立即做一次只取 UID 的移出核对
+///     （Gmail 归档后下一次同步即可从 INBOX 移除）；此外按间隔做 UID-only 全量核对（并在无 CONDSTORE 时校正全部 Flags）。
 /// 只有确认 UID 已不在服务器上才删除本地记录；所有删除只作用于本地；正文缓存在事务提交后清理且只限 AppFileCache 目录内。
 /// 普通同步绝不下载正文或附件。
 /// </summary>
@@ -269,6 +279,34 @@ public sealed class MailboxSyncEngine
         // 3. 定期 UID-only 全量核对（远端删除；无可用 CONDSTORE 时同时校正全部旧邮件的 Flags）
         var interval = session.SupportsQResync && condStoreUsable ? _options.QResyncReconcileInterval : _options.FullReconcileInterval;
         var due = _options.ForceFullReconcile || state.LastFullReconcileAt is null || now - state.LastFullReconcileAt.Value >= interval;
+
+        // 3a. 移出检测（不到全量核对时间时）：EXISTS（EXAMINE 已返回，零额外请求）少于本地游标以内的邮件数 ⇒ 有邮件离开了该文件夹
+        //     （Gmail 归档 / 移入垃圾箱 / 其它客户端移动或删除）。立即用一次 UID SEARCH ALL（只有 UID，不取正文 / 附件 / Flags）找出并只删除本地记录。
+        //     不更新 LastFullReconcileAt，定期全量核对（含无 CONDSTORE 时的 Flags 校正）照常进行；计数一致时不发任何请求。
+        if (!due && _options.DetectRemovalsByCount && state.LastProcessedUid > 0)
+        {
+            var cursor = state.LastProcessedUid;
+            var localCount = await Db(() => _emails.CountLocalUidsAsync(accountId, mailbox, cursor, ct)).ConfigureAwait(false);
+            if (localCount > snap.Count)
+            {
+                result.RemovalCheckPerformed = true;
+                progress?.Report(new MailboxSyncProgress(mailbox, MailboxSyncPhase.Reconcile, 0, 0));
+                IReadOnlyList<uint> serverAll = snap.Count == 0
+                    ? Array.Empty<uint>()
+                    : Normalize(await Net(() => session.SearchAllUidsAsync(ct), "核对已移出的邮件").ConfigureAwait(false));
+                var serverSet = new HashSet<uint>(serverAll);
+                var local = await Db(() => _emails.GetLocalUidsAsync(accountId, mailbox, ct)).ConfigureAwait(false);
+                var removed = local.Where(u => u <= cursor && !serverSet.Contains(u)).ToList();
+                _log?.Invoke($"removal check {mailbox}: exists={snap.Count} local={localCount} removed={removed.Count}");
+                if (removed.Count > 0)
+                {
+                    var applied = await Db(() => _emails.ApplyFlagsAndRemovalsAsync(accountId, mailbox, Array.Empty<RemoteFlags>(), removed, state, ct)).ConfigureAwait(false);
+                    result.RemovedLocal += applied.Removed;
+                    result.BodyFilesDeleted += await CleanupAsync(accountId, applied.RemovedBodyPaths, ct).ConfigureAwait(false);
+                }
+            }
+        }
+
         if (due)
         {
             result.FullReconcilePerformed = true;

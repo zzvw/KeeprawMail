@@ -21,6 +21,7 @@ public class PreviewMetricsTests : IAsyncLifetime
     private readonly ITestOutputHelper _out;
     private readonly SyncTestDb _db = new();
     private ScriptedImapServer _server = null!;
+    private readonly List<ScriptedImapServer> _retiredServers = new();
 
     public PreviewMetricsTests(ITestOutputHelper output) => _out = output;
 
@@ -33,6 +34,7 @@ public class PreviewMetricsTests : IAsyncLifetime
     public async Task DisposeAsync()
     {
         await _server.DisposeAsync();
+        foreach (var server in _retiredServers) await server.DisposeAsync();
         _db.Dispose();
     }
 
@@ -197,9 +199,13 @@ public class PreviewMetricsTests : IAsyncLifetime
 
         // 7. 真实发件方结构混合（账号 rw，20 封）：AA 类（空纯文本 + 约 6 KB CSS 头部的 QP html）×5、GitHub 通知类（QP 纯文本 + html）×5、
         //    Tiptrans 类（单部分 base64 html，style 跨越第一次下载边界）×5、只有附件 ×3、CSS 头部超过 8 KiB 的 html ×2
-        _server.AddMailbox("RealWorld");
-        for (var i = 1; i <= 20; i++) _server.Append("RealWorld", RealWorldMail(i));
-        await using (var s = await SessionAsync()) await _db.Engine().SyncAsync(s, "rw", "RealWorld");
+        //    账号 rw 使用自己的服务器，邮件在它的 INBOX 中（默认首页 = 各账号 INBOX，预览候选与首页同一范围；其它文件夹不预览）。
+        //    之后 SessionAsync / Measure 都指向 rw 的服务器（预览任务的会话工厂同样经由 SessionAsync）。
+        _retiredServers.Add(_server);
+        _server = new ScriptedImapServer();
+        _server.AddMailbox("INBOX");
+        for (var i = 1; i <= 20; i++) _server.Append("INBOX", RealWorldMail(i));
+        await using (var s = await SessionAsync()) await _db.Engine().SyncAsync(s, "rw", "INBOX");
         var mix = await Measure(async () => run = await previews.RunOnceAsync("rw"));
         var mixRun = run!;
         Assert.Equal(20, mixRun.Candidates);

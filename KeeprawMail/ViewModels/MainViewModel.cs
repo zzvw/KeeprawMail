@@ -94,7 +94,9 @@ namespace KeeprawMail.ViewModels
                     Accounts.Add(account);
                 }
 
-                // 2. 加载邮件
+                // 2. 加载邮件（默认首页 = 所有账号的 INBOX，每账号最近 100 封，按真实时间倒序）
+                //    重新读取 Windows 系统时区：用户切换时区后，刷新列表即按新时区显示时间
+                Core.Formatting.MailDateFormatter.RefreshSystemTimeZone();
                 var localEmails = await _databaseContext.GetEmailsAsync();
                 Emails.Clear();
                 foreach (var email in localEmails)

@@ -288,6 +288,30 @@ public sealed partial class EmailStore
     /// <summary>列表默认每个账号最多显示的邮件数（完整分页留给后续 PR）。</summary>
     public const int DefaultPerAccountLimit = 100;
 
+    /// <summary>
+    /// 默认首页的文件夹条件：服务器的收件箱 <c>INBOX</c>。RFC 3501 规定 INBOX 不区分大小写，因此 "Inbox" / "inbox" 也匹配；
+    /// 其它文件夹名称一律不做大小写折叠（条件只与字面量 INBOX 比较，不会匹配 "INBOX/子文件夹"、"[Gmail]/All Mail" 等）。
+    /// SQLite 的 NOCASE 只折叠 ASCII 字母，与 IMAP 对 INBOX 的规定一致。
+    /// </summary>
+    public const string DefaultListFilterSql = "Mailbox = 'INBOX' COLLATE NOCASE";
+
+    /// <summary>
+    /// 列表排序：按真实时刻（绝对时间）倒序。Date 以 ISO 8601 往返格式保存且保留原始偏移（+08:00、+00:00 等），
+    /// 直接按文本排序时不同偏移的邮件会错位（例如 22:00+08:00 实际早于 15:00+00:00），因此用 julianday() 换算成同一时间轴；
+    /// 时刻相同时按 Id 固定顺序。存储格式不变。
+    /// </summary>
+    public const string ListOrderSql = "julianday(Date) DESC, Date DESC, Id DESC";
+
+    /// <summary>
+    /// 首页列表与预览候选共用的数据源：INBOX 过滤 + 每账号按真实时间倒序编号（rn）。两处只在外层追加各自的条件。
+    /// </summary>
+    internal static string DefaultListSourceSql(string columns) => $@"
+                SELECT {columns}, ROW_NUMBER() OVER (PARTITION BY AccountId ORDER BY {ListOrderSql}) AS rn
+                FROM Emails WHERE {DefaultListFilterSql}";
+
+    /// <summary>与 <see cref="DefaultListFilterSql"/> 相同的规则（C# 侧判断用）。</summary>
+    public static bool IsDefaultListMailbox(string? mailbox) => string.Equals(mailbox, "INBOX", StringComparison.OrdinalIgnoreCase);
+
     private const string Columns = "Id, Subject, SenderName, SenderAddress, Date, Snippet, BodyLocalPath, IsRead, Mailbox, AccountId, IsStarred, ImapUid, PreviewState";
 
     public async Task SaveAsync(IEnumerable<StoredEmail> emails, CancellationToken ct = default)
@@ -335,8 +359,10 @@ public sealed partial class EmailStore
     }
 
     /// <summary>
-    /// 每个账号各取最近 <paramref name="perAccountLimit"/> 封，再整体按时间倒序。
-    /// 旧实现全局 LIMIT 100，一个账号的大量新邮件会把其它账号的邮件完全挤出列表。
+    /// 默认首页（统一收件箱 / Unified Inbox）：每个账号的 INBOX 各取最近 <paramref name="perAccountLimit"/> 封，再整体按真实时间倒序。
+    /// 只按 <see cref="DefaultListFilterSql"/> 过滤显示范围，不删除、不合并任何记录：Sent / Drafts / Trash / Junk / Archive 等
+    /// 其它文件夹的邮件继续同步、保存在 Emails 表中（游标、正文缓存、预览状态都不变），之后可通过文件夹入口访问。
+    /// 预览候选（<see cref="GetPreviewCandidatesAsync"/>）使用同一个 <see cref="DefaultListSourceSql"/>，因此后台预览只针对首页可见的邮件。
     /// </summary>
     public async Task<List<StoredEmail>> GetRecentAsync(int perAccountLimit = DefaultPerAccountLimit, CancellationToken ct = default)
     {
@@ -344,10 +370,8 @@ public sealed partial class EmailStore
         await c.OpenAsync(ct).ConfigureAwait(false);
         using var cmd = c.CreateCommand();
         cmd.CommandText = $@"
-            SELECT {Columns} FROM (
-                SELECT {Columns}, ROW_NUMBER() OVER (PARTITION BY AccountId ORDER BY Date DESC) AS rn FROM Emails
-            ) WHERE rn <= $Limit
-            ORDER BY Date DESC";
+            SELECT {Columns} FROM ({DefaultListSourceSql(Columns)}) WHERE rn <= $Limit
+            ORDER BY {ListOrderSql}";
         cmd.Parameters.AddWithValue("$Limit", perAccountLimit);
         return await ReadAsync(cmd, ct).ConfigureAwait(false);
     }
@@ -357,7 +381,7 @@ public sealed partial class EmailStore
         using var c = new SqliteConnection(_connectionString);
         await c.OpenAsync(ct).ConfigureAwait(false);
         using var cmd = c.CreateCommand();
-        cmd.CommandText = $"SELECT {Columns} FROM Emails WHERE AccountId = $A ORDER BY Date DESC";
+        cmd.CommandText = $"SELECT {Columns} FROM Emails WHERE AccountId = $A ORDER BY {ListOrderSql}";
         cmd.Parameters.AddWithValue("$A", accountId);
         return await ReadAsync(cmd, ct).ConfigureAwait(false);
     }

@@ -257,11 +257,13 @@ public class IncrementalSyncTests : IDisposable
         await _db.Emails.UpdateBodyAsync(id7, path7, "seven");
         mb.Expunge(7);
 
-        await SyncAsync("acc", "INBOX"); // 间隔未到：还未发现删除
+        // 本测试只验证定期 UID 全量核对这条路径，因此关闭 EXISTS 计数触发的移出检测（该检测见 InboxArchiveReconcileTests）
+        var periodicOnly = new MailboxSyncOptions { DetectRemovalsByCount = false };
+        await SyncAsync("acc", "INBOX", periodicOnly); // 间隔未到：还未发现删除
         Assert.Equal(20, await _db.ScalarAsync("SELECT COUNT(*) FROM Emails"));
 
         _db.Time.Advance(TimeSpan.FromHours(6));
-        var r = await SyncAsync("acc", "INBOX");
+        var r = await SyncAsync("acc", "INBOX", periodicOnly);
         Assert.Equal(1, r.RemovedLocal);
         Assert.Equal(19, await _db.ScalarAsync("SELECT COUNT(*) FROM Emails"));
         Assert.False(File.Exists(path7));

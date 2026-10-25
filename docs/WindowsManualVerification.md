@@ -1,4 +1,4 @@
-# Windows 手工验收清单（PR #1、PR #2、PR #3）
+# Windows 手工验收清单（PR #1、PR #2、PR #3、统一收件箱与本地时间修复）
 
 以下项目**需要真实 Windows 环境和你自己的 Google 账号 / OAuth Client ID**，CI 无法代替。
 每一项完成后在方框里打勾，并在 PR 中回复结果。所有项目当前状态均为 **待人工验证**。
@@ -192,10 +192,52 @@
 - [ ] 仍显示“无文本预览”的邮件：`SELECT Mailbox, PreviewDiag FROM Emails WHERE PreviewState = 2 LIMIT 20;` —— 应为 `r=no_text_part`（只有附件）或 `r=empty_text`。若有正文却是 NoText，请发回该行的 `PreviewDiag`。
 - [ ] 显示“打开邮件查看内容”的邮件：`SELECT Mailbox, PreviewDiag FROM Emails WHERE PreviewState = 4 LIMIT 20;` —— 预期 `r=beyond_budget`（正文前的 CSS 等超过 8 KiB）、`r=unknown_cte` 或 `r=no_structure`。
 - [ ] 显示“预览暂不可用”的 GitHub 通知：`SELECT Mailbox, PreviewDiag, PreviewAttempts FROM Emails WHERE PreviewState = 3 LIMIT 20;`
-      —— `r=uid_missing` 表示该邮件已在服务器上被归档 / 删除 / 移走（本地记录会在下一次 UID 核对时删除，Gmail 最长 6 小时）；
+      —— `r=uid_missing` 表示该邮件已在服务器上被归档 / 删除 / 移走（统一收件箱修复之后，本地记录在下一次同步的移出检测中删除，见第 15 节）；
       `r=server_no` / `r=server_no_structure` 表示 Gmail 拒绝了该邮件的请求（带 `x=ImapCommandException`）；`r=connection` 表示断线。请把 `r=` 与 `x=` 发回。
-- [ ] 在 Gmail 网页端归档一封收件箱中尚未加载预览的邮件后同步：该邮件显示“预览暂不可用”，`PreviewDiag` 为 `r=uid_missing;q=0;b=0`；6 小时内的下一次核对后从列表消失（已知问题，见 `docs/SyncDesign.md` 10.1）。
+- [ ] （PR3 当时的已知问题，已由第 15 节的修复解决：归档后的下一次同步即从首页消失，不再出现 `uid_missing`。）
 
 ### E. 流量
 - [ ] `diagnostics.log` 的汇总行 `maxPerMessage=` 不超过 8192；`partial` 不超过 candidates × 2。
 - [ ] 带大附件的邮件：没有附件大小的流量。
+
+## 15. 统一收件箱、Gmail 重复 / 归档 / 垃圾箱与本地时间
+
+设计说明见 `docs/SyncDesign.md` 第 5.1、10、11 节。本次修复**没有数据库迁移**（`PRAGMA user_version` 仍为 5）。请先完全退出旧版本，备份 `%LOCALAPPDATA%\KeeprawMail\keepraw.db` 与 `Emails` 目录。
+
+### A. 升级前记录（SQLite 工具只读打开备份）
+- [ ] `SELECT Mailbox, COUNT(*) FROM Emails GROUP BY Mailbox;` —— 记下每个文件夹的行数（升级后应完全相同，除了第 C 节中被归档 / 删除的邮件）。
+- [ ] `SELECT COUNT(*) FROM Emails WHERE IFNULL(BodyLocalPath,'') <> '';` —— 记下正文缓存数。
+
+### B. Gmail 重复邮件
+- [ ] 启动新版本（不必同步）：之前显示两次的 Gmail 测试邮件（发给自己的邮件）在首页只显示一次；悬停 / 打开确认是收件箱中的那一份。
+- [ ] 数据库：`SELECT Mailbox, ImapUid FROM Emails WHERE Subject = '<那封邮件的主题>';` —— 仍有 `INBOX` 与 `[Gmail]/Sent Mail` 各一行（数据没有被删除或合并）。
+- [ ] 给自己再发一封新邮件，点击同步：首页只出现一次。
+- [ ] 同一个发件人连续发两封主题、时间都相同的邮件（例如两封相同的通知）：首页显示两封，不会被合并。
+- [ ] 首页只显示各账号的收件箱：Gmail 的已发送、草稿、垃圾邮件（Spam）、垃圾箱中的邮件不出现；QQ / 163 等账号的“已删除”“垃圾邮件”“已发送”也不出现。
+- [ ] 多账号：两个账号都有收件箱邮件时，两个账号的邮件都在首页，按时间交错排列；邮件很多的账号不会把另一个账号挤出列表（每账号最多 100 封）。
+- [ ] `SELECT Mailbox, COUNT(*) FROM Emails GROUP BY Mailbox;` —— 与第 A 节相同（其它文件夹的数据仍在本地）。
+
+### C. Gmail 归档与垃圾箱
+- [ ] 在 Gmail 网页端**归档**首页中的一封邮件，回到 KeeprawMail 点击“同步”一次：该邮件从首页消失（不再需要等 6 小时）。
+- [ ] `diagnostics.log` 中该账号 INBOX 一行为 `removalCheck=True removed=1`，并有 `removal check INBOX: exists=… local=… removed=1`；同一次同步中没有正文下载（无 `[reader]` 行）。
+- [ ] 再点一次同步：`removalCheck=False`（计数一致时不再发送 `UID SEARCH ALL`）。
+- [ ] 在 Gmail 网页端把首页中的一封邮件**移入垃圾箱**，同步一次：从首页消失；`SELECT Mailbox FROM Emails WHERE Subject = '<主题>';` 出现 `[Gmail]/Trash` 的一行（数据保留，首页不显示）。
+- [ ] 归档一封**发给自己**且两份都打开过的邮件：同步后首页不再显示；`[Gmail]/Sent Mail` 中的那一行仍在、`BodyLocalPath` 不变。
+- [ ] 在 Gmail 网页端检查：KeeprawMail 同步没有改变任何邮件的标签、已读状态，也没有把邮件移回收件箱（同步只读）。
+- [ ] 归档后不会再出现“预览暂不可用”（`r=uid_missing`）的残留项。
+- [ ] 流量：`diagnostics.log` 中 `[preview] preview <账号>: candidates=…` 只统计首页（INBOX）邮件；垃圾箱 / 已发送中的新邮件不会触发预览。
+
+### D. 本地时间
+- [ ] Windows 时区为“(UTC+08:00) 北京，重庆，香港特别行政区，乌鲁木齐”：从另一个邮箱给 Gmail 发一封邮件，记下手机 / 网页上的收件时间（如 22:00）；首页列表显示 22:00（不是 14:00）；悬停时间显示 `yyyy-MM-dd 22:00:xx`；打开邮件，阅读器头部 `Date:` 同样是 22:00。
+- [ ] QQ / 163 等账号的邮件时间同样是北京时间；多个账号的邮件按真实先后交错排列（不会因为 Gmail 以 UTC 保存而整体排到后面）。
+- [ ] 回复 / 转发：引用头部的“日期:”是本地时间。
+- [ ] 跨日：北京时间 0 点之后查看前一天 23 点多收到的邮件，显示“昨天”；当天 0 点之后的邮件显示时间。2–6 天前显示星期，更早显示 `MM-dd`，往年显示 `yyyy-MM-dd`。
+- [ ] 切换到美国时区：在 Windows 设置 → 时间和语言 → 日期和时间中关闭“自动设置时区”，选择“(UTC-08:00) 太平洋时间(美国和加拿大)”，回到 KeeprawMail 点击“同步”（或重启应用）：同一封邮件显示为太平洋时间（10 月为夏令时 UTC-7，北京 22:00 ⇒ 07:00；11 月 1 日之后为 UTC-8 ⇒ 06:00）；“今天 / 昨天”按太平洋时间的日期判断；列表顺序不变。
+- [ ] 再切换到“(UTC-07:00) 亚利桑那”：同一封邮件显示 07:00（全年无夏令时）。
+- [ ] 切换回北京时间并同步：恢复 22:00。数据库中该邮件的 `Date` 字段在整个过程中没有变化（`SELECT Date FROM Emails WHERE Subject = '<主题>';`，Gmail 为 `…T14:00:00.0000000+00:00`）。
+
+### E. 回归
+- [ ] PR3 摘要预览：首页邮件仍显示最多 3 行摘要；“无文本预览”“打开邮件查看内容”“预览暂不可用”的含义不变；带大附件的邮件没有附件流量（`maxPerMessage=` ≤ 8192）。
+- [ ] 打开未缓存的邮件按需下载正文；再次打开不联网；已读 / 星标正常。
+- [ ] 账号、凭据、正文缓存数与第 A 节一致；完全退出后重启，`PRAGMA user_version` 仍为 5。
+

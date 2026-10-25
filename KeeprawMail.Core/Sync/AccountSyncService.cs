@@ -64,7 +64,7 @@ public sealed class AccountSyncService
                     report.FlagUpdates += r.FlagUpdates;
                     report.RemovedLocal += r.RemovedLocal;
                     if (r.UidValidityReset) report.UidValidityResets.Add(folder);
-                    _log?.Invoke($"folder {email}/{folder}: baseline={r.BaselinePerformed} new={r.NewMessages} flags={r.FlagUpdates}({r.FlagStrategy}) removed={r.RemovedLocal} reconcile={r.FullReconcilePerformed} uidvalidityReset={r.UidValidityReset}");
+                    _log?.Invoke($"folder {email}/{folder}: baseline={r.BaselinePerformed} new={r.NewMessages} flags={r.FlagUpdates}({r.FlagStrategy}) removed={r.RemovedLocal} reconcile={r.FullReconcilePerformed} removalCheck={r.RemovalCheckPerformed} uidvalidityReset={r.UidValidityReset}");
                     return r.NewMessages;
                 }, _log).ConfigureAwait(false);
             }
