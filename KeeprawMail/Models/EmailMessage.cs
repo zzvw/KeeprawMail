@@ -174,5 +174,26 @@ namespace KeeprawMail.Models
         /// 所属账号 ID
         /// </summary>
         public string AccountId { get; set; } = string.Empty;
+
+        private string _locationLabel = string.Empty;
+        /// <summary>
+        /// 搜索结果中显示的“账号 · 文件夹”（例如 me@qq.com · 已发送），让用户分辨跨账号 / 跨文件夹的结果。
+        /// 默认首页（统一收件箱）不显示（为空）。只用于显示，不写入数据库。
+        /// </summary>
+        public string LocationLabel
+        {
+            get => _locationLabel;
+            set
+            {
+                if (SetProperty(ref _locationLabel, value ?? string.Empty))
+                    OnPropertyChanged(nameof(LocationVisibility));
+            }
+        }
+
+        public Visibility LocationVisibility => string.IsNullOrEmpty(_locationLabel) ? Visibility.Collapsed : Visibility.Visible;
+
+        /// <summary>文件夹的显示名：INBOX（不区分大小写）显示为“收件箱”，其它文件夹显示服务器上的原始名称。</summary>
+        public static string MailboxDisplayName(string? mailbox) =>
+            string.Equals(mailbox, "INBOX", StringComparison.OrdinalIgnoreCase) ? "收件箱" : (mailbox ?? string.Empty);
     }
 }
