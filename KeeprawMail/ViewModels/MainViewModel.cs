@@ -651,10 +651,11 @@ namespace KeeprawMail.ViewModels
         [RelayCommand]
         private async Task MarkAsUnreadAsync()
         {
-            if (SelectedEmail != null)
+            var email = SelectedEmail;
+            if (email != null)
             {
                 // 1. 本地更新
-                SelectedEmail.IsRead = false;
+                email.IsRead = false;
                 
                 // 2. 服务器更新
                 StatusMessage = "正在标记为未读...";
@@ -662,13 +663,13 @@ namespace KeeprawMail.ViewModels
                 {
                     // 获取当前账号
                     var accounts = await _databaseContext.GetAccountsAsync();
-                    var account = accounts.FirstOrDefault(a => a.Id == SelectedEmail.AccountId);
+                    var account = accounts.FirstOrDefault(a => a.Id == email.AccountId);
                     
                     if (account != null)
                     {
                         using var imapService = new Services.ImapService(); // 使用新的实例
                         await imapService.ConnectAsync(account);
-                        await imapService.MarkAsUnreadAsync(SelectedEmail.Mailbox, SelectedEmail.Id);
+                        await imapService.MarkAsUnreadAsync(email.Mailbox, email.Id);
                         StatusMessage = "已标记为未读";
                     }
                     else
@@ -677,7 +678,7 @@ namespace KeeprawMail.ViewModels
                     }
 
                     // 3. 更新数据库状态
-                    await _databaseContext.UpdateEmailReadStatusAsync(SelectedEmail.Id, false);
+                    await _databaseContext.UpdateEmailReadStatusAsync(email.Id, false);
                 }
                 catch (System.Exception ex)
                 {
