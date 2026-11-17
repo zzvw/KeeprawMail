@@ -8,6 +8,11 @@
     xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
     mc:Ignorable="d">
 
+    <!-- Ctrl+E：把焦点移到搜索框（焦点在页面内的 XAML 控件上时有效） -->
+    <Page.KeyboardAccelerators>
+        <KeyboardAccelerator Modifiers="Control" Key="E" Invoked="FocusSearch_Invoked"/>
+    </Page.KeyboardAccelerators>
+
     <Grid Background="{ThemeResource ApplicationPageBackgroundThemeBrush}">
         <Grid.RowDefinitions>
             <!-- Row 0: Unified Toolbar -->
@@ -62,15 +67,15 @@
             </CommandBar>
 
             <!-- Search Box -->
-            <AutoSuggestBox Grid.Column="2" 
+            <!-- 按 Enter 或点击放大镜提交搜索（QuerySubmitted）；清空（含 × 按钮）恢复统一收件箱。只搜索本机已同步的邮件。 -->
+            <AutoSuggestBox x:Name="SearchBox"
+                            Grid.Column="2" 
                             Width="250" 
                             PlaceholderText="Search emails (Ctrl+E)" 
                             QueryIcon="Find"
-                            Text="{x:Bind ViewModel.SearchQuery, Mode=TwoWay}">
-                <AutoSuggestBox.KeyboardAccelerators>
-                    <KeyboardAccelerator Key="Enter" />
-                </AutoSuggestBox.KeyboardAccelerators>
-            </AutoSuggestBox>
+                            ToolTipService.ToolTip="在本机已同步的邮件中搜索主题、发件人和摘要。&#x0a;示例：invoice payment　&quot;flight confirmation&quot;　subject:发票　from:amazon"
+                            Text="{x:Bind ViewModel.SearchQuery, Mode=TwoWay}"
+                            QuerySubmitted="SearchBox_QuerySubmitted"/>
         </Grid>
 
         <!-- Mail View Area (Split View) -->
@@ -85,84 +90,146 @@
             </Grid.ColumnDefinitions>
 
             <!-- Mail List - ItemsSource set in Code-behind -->
-            <ListView Grid.Column="0" 
-                      x:Name="EmailListView"
-                      SelectionMode="Single"
-                      SelectionChanged="EmailListView_SelectionChanged">
-                <ListView.ItemTemplate>
-                    <DataTemplate x:DataType="models:EmailMessage">
-                        <Grid Padding="12,8" ColumnSpacing="12">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="Auto"/>  <!-- Unread indicator -->
-                                <ColumnDefinition Width="*"/>     <!-- Content -->
-                                <ColumnDefinition Width="Auto"/>  <!-- Time -->
-                            </Grid.ColumnDefinitions>
-                            
-                            <!-- 未读指示器 -->
-                            <Ellipse Grid.Column="0" 
-                                     Width="8" 
-                                     Height="8" 
-                                     Fill="{ThemeResource SystemAccentColor}"
-                                     VerticalAlignment="Top"
-                                     Margin="0,6,0,0"
-                                     Visibility="{x:Bind UnreadIndicatorVisibility, Mode=OneWay}"/>
-                            
-                            <!-- 邮件内容 -->
-                            <StackPanel Grid.Column="1" Spacing="2">
-                                <Grid>
-                                    <Grid.ColumnDefinitions>
-                                        <ColumnDefinition Width="*"/>
-                                        <ColumnDefinition Width="Auto"/>
-                                    </Grid.ColumnDefinitions>
+            <Grid Grid.Column="0">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/> <!-- 搜索结果说明 -->
+                    <RowDefinition Height="*"/>    <!-- 列表 / 空状态 -->
+                    <RowDefinition Height="Auto"/> <!-- 加载更多 -->
+                </Grid.RowDefinitions>
+
+                <!-- 搜索状态说明（仅搜索时显示）：共几封 / 已显示几封 / 输入错误或失败提示，以及“清除搜索” -->
+                <Grid Grid.Row="0"
+                      Visibility="{x:Bind ViewModel.SearchBannerVisibility, Mode=OneWay}"
+                      Padding="12,6"
+                      ColumnSpacing="8"
+                      Background="{ThemeResource SystemControlBackgroundChromeMediumLowBrush}"
+                      BorderBrush="{ThemeResource SystemControlForegroundBaseLowBrush}"
+                      BorderThickness="0,0,0,1">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <ProgressRing Grid.Column="0" Width="16" Height="16" IsActive="True"
+                                  Visibility="{x:Bind ViewModel.SearchProgressVisibility, Mode=OneWay}"/>
+                    <TextBlock Grid.Column="1"
+                               Text="{x:Bind ViewModel.SearchSummary, Mode=OneWay}"
+                               FontSize="12"
+                               VerticalAlignment="Center"
+                               TextWrapping="Wrap"/>
+                    <HyperlinkButton Grid.Column="2"
+                                     Content="清除搜索"
+                                     Padding="4,2"
+                                     FontSize="12"
+                                     Command="{x:Bind ViewModel.ClearSearchCommand}"/>
+                </Grid>
+
+                <ListView Grid.Row="1"
+                          x:Name="EmailListView"
+                          SelectionMode="Single"
+                          SelectionChanged="EmailListView_SelectionChanged">
+                    <ListView.ItemTemplate>
+                        <DataTemplate x:DataType="models:EmailMessage">
+                            <Grid Padding="12,8" ColumnSpacing="12">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto"/>  <!-- Unread indicator -->
+                                    <ColumnDefinition Width="*"/>     <!-- Content -->
+                                    <ColumnDefinition Width="Auto"/>  <!-- Time -->
+                                </Grid.ColumnDefinitions>
+                                
+                                <!-- 未读指示器 -->
+                                <Ellipse Grid.Column="0" 
+                                         Width="8" 
+                                         Height="8" 
+                                         Fill="{ThemeResource SystemAccentColor}"
+                                         VerticalAlignment="Top"
+                                         Margin="0,6,0,0"
+                                         Visibility="{x:Bind UnreadIndicatorVisibility, Mode=OneWay}"/>
+                                
+                                <!-- 邮件内容 -->
+                                <StackPanel Grid.Column="1" Spacing="2">
+                                    <Grid>
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                        </Grid.ColumnDefinitions>
+                                        
+                                        <!-- 发件人 -->
+                                        <TextBlock Text="{x:Bind SenderName}" 
+                                                   FontWeight="{x:Bind SubjectFontWeight, Mode=OneWay}"
+                                                   FontSize="14"
+                                                   TextTrimming="CharacterEllipsis"
+                                                   MaxLines="1"/>
+    
+                                        <!-- 星标按钮 -->
+                                        <Button Grid.Column="1"
+                                                Background="Transparent"
+                                                BorderThickness="0"
+                                                Padding="4"
+                                                Click="StarButton_Click">
+                                            <FontIcon Glyph="{x:Bind StarGlyph, Mode=OneWay}" 
+                                                      Foreground="{x:Bind StarForeground, Mode=OneWay}" 
+                                                      FontSize="16"/>
+                                        </Button>
+                                    </Grid>
                                     
-                                    <!-- 发件人 -->
-                                    <TextBlock Text="{x:Bind SenderName}" 
-                                               FontWeight="{x:Bind SubjectFontWeight, Mode=OneWay}"
-                                               FontSize="14"
+                                    <!-- 主题 -->
+                                    <TextBlock Text="{x:Bind Subject}" 
+                                               FontSize="13"
                                                TextTrimming="CharacterEllipsis"
                                                MaxLines="1"/>
-
-                                    <!-- 星标按钮 -->
-                                    <Button Grid.Column="1"
-                                            Background="Transparent"
-                                            BorderThickness="0"
-                                            Padding="4"
-                                            Click="StarButton_Click">
-                                        <FontIcon Glyph="{x:Bind StarGlyph, Mode=OneWay}" 
-                                                  Foreground="{x:Bind StarForeground, Mode=OneWay}" 
-                                                  FontSize="16"/>
-                                    </Button>
-                                </Grid>
+    
+                                    <!-- 搜索结果：所属账号 · 文件夹（首页统一收件箱不显示） -->
+                                    <TextBlock Text="{x:Bind LocationLabel, Mode=OneWay}"
+                                               Visibility="{x:Bind LocationVisibility, Mode=OneWay}"
+                                               FontSize="11"
+                                               Foreground="{ThemeResource SystemControlForegroundAccentBrush}"
+                                               TextTrimming="CharacterEllipsis"
+                                               MaxLines="1"/>
+                                    
+                                    <!-- 摘要：纯文本 TextBlock（不是 WebView2），最多 3 行，超出显示省略号；未就绪时显示预览状态提示 -->
+                                    <TextBlock Text="{x:Bind SnippetDisplay, Mode=OneWay}" 
+                                               Opacity="{x:Bind SnippetOpacity, Mode=OneWay}"
+                                               FontSize="12"
+                                               Foreground="{ThemeResource SystemControlForegroundBaseMediumBrush}"
+                                               TextTrimming="CharacterEllipsis"
+                                               MaxLines="3"
+                                               TextWrapping="Wrap"
+                                               IsTextSelectionEnabled="False"/>
+                                </StackPanel>
                                 
-                                <!-- 主题 -->
-                                <TextBlock Text="{x:Bind Subject}" 
-                                           FontSize="13"
-                                           TextTrimming="CharacterEllipsis"
-                                           MaxLines="1"/>
-                                
-                                <!-- 摘要：纯文本 TextBlock（不是 WebView2），最多 3 行，超出显示省略号；未就绪时显示预览状态提示 -->
-                                <TextBlock Text="{x:Bind SnippetDisplay, Mode=OneWay}" 
-                                           Opacity="{x:Bind SnippetOpacity, Mode=OneWay}"
-                                           FontSize="12"
+                                <!-- 时间戳 -->
+                                <TextBlock Grid.Column="2" 
+                                           Text="{x:Bind DisplayDate}" 
+                                           FontSize="11"
                                            Foreground="{ThemeResource SystemControlForegroundBaseMediumBrush}"
-                                           TextTrimming="CharacterEllipsis"
-                                           MaxLines="3"
-                                           TextWrapping="Wrap"
-                                           IsTextSelectionEnabled="False"/>
-                            </StackPanel>
-                            
-                            <!-- 时间戳 -->
-                            <TextBlock Grid.Column="2" 
-                                       Text="{x:Bind DisplayDate}" 
-                                       FontSize="11"
-                                       Foreground="{ThemeResource SystemControlForegroundBaseMediumBrush}"
-                                       VerticalAlignment="Top"
-                                       Margin="0,4,0,0"
-                                       ToolTipService.ToolTip="{x:Bind FullDateTooltip}"/>
-                        </Grid>
-                    </DataTemplate>
-                </ListView.ItemTemplate>
-            </ListView>
+                                           VerticalAlignment="Top"
+                                           Margin="0,4,0,0"
+                                           ToolTipService.ToolTip="{x:Bind FullDateTooltip}"/>
+                            </Grid>
+                        </DataTemplate>
+                    </ListView.ItemTemplate>
+                </ListView>
+
+                <!-- 搜索空状态：没有匹配结果时明确提示，不保留旧结果 -->
+                <TextBlock Grid.Row="1"
+                           Text="{x:Bind ViewModel.SearchEmptyText, Mode=OneWay}"
+                           Visibility="{x:Bind ViewModel.SearchEmptyVisibility, Mode=OneWay}"
+                           Margin="24"
+                           TextWrapping="Wrap"
+                           TextAlignment="Center"
+                           HorizontalAlignment="Center"
+                           VerticalAlignment="Top"
+                           Foreground="{ThemeResource SystemControlForegroundBaseMediumBrush}"/>
+
+                <!-- 大量结果分页：每次追加 200 封，不一次加载全部 -->
+                <Button Grid.Row="2"
+                        Content="加载更多结果"
+                        HorizontalAlignment="Stretch"
+                        Margin="8,4"
+                        Visibility="{x:Bind ViewModel.LoadMoreVisibility, Mode=OneWay}"
+                        Command="{x:Bind ViewModel.LoadMoreSearchResultsCommand}"/>
+            </Grid>
 
             <!-- Grid Splitter -->
             <Border Grid.Column="1" Width="1" Background="{ThemeResource SystemControlForegroundBaseLowBrush}"/>

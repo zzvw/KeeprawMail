@@ -331,4 +331,4 @@ GitHub 一行中的 ⑦⑧⑨ 是根据代码路径与 Gmail 的已知行为推�
 ## 12. 后续事项
 
 - 文件夹导航 / 筛选界面（访问 Sent、Trash、Archive 等已同步的数据）不在本 PR 中实现；数据已在本地保留，`DefaultListSourceSql` 之外的查询可以直接复用 `ListOrderSql`。
-- FTS5 搜索界面仍未接入（`SearchAsync` 仍是 TODO），本 PR 不修改。
+- FTS5 搜索已在 PR #6 接入，见 `docs/SearchDesign.md`（搜索范围为主题、发件人、摘要，不含完整正文）。

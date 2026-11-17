@@ -248,26 +248,39 @@ namespace KeeprawMail.Data
         /// 获取默认首页（统一收件箱）邮件：每个账号的 INBOX 各取最近 100 封（避免某个账号的大量新邮件把其它账号挤出列表），整体按真实时间倒序。
         /// 其它文件夹（Sent / Drafts / Trash / Junk / Archive）的邮件仍在本地保存，只是不在首页显示。
         /// </summary>
-        public async Task<System.Collections.Generic.List<Models.EmailMessage>> GetEmailsAsync()
+        public async Task<System.Collections.Generic.List<Models.EmailMessage>> GetEmailsAsync(System.Threading.CancellationToken cancellationToken = default)
         {
-            var rows = await Emails.GetRecentAsync(EmailStore.DefaultPerAccountLimit);
-            return rows.Select(r => new Models.EmailMessage
-            {
-                Id = r.Id,
-                Subject = r.Subject,
-                SenderName = r.SenderName,
-                SenderAddress = r.SenderAddress,
-                Date = r.Date,
-                Snippet = r.Snippet,
-                BodyLocalPath = r.BodyLocalPath,
-                IsRead = r.IsRead,
-                Mailbox = r.Mailbox,
-                AccountId = r.AccountId,
-                IsStarred = r.IsStarred,
-                ImapUid = r.ImapUid,
-                PreviewState = r.PreviewState,
-            }).ToList();
+            var rows = await Emails.GetRecentAsync(EmailStore.DefaultPerAccountLimit, cancellationToken);
+            return rows.Select(ToModel).ToList();
         }
+
+        /// <summary>
+        /// 本地邮件搜索（所有账号、所有已同步文件夹；不受首页每账号 100 封限制）。只读本地 SQLite，不连接邮件服务器。
+        /// 一次查询直接返回一页邮件记录（实现见 Core.Storage.EmailStore.SearchAsync）。
+        /// </summary>
+        public async Task<(System.Collections.Generic.List<Models.EmailMessage> Items, int TotalCount)> SearchEmailsAsync(
+            KeeprawMail.Core.Search.MailSearchQuery query, int limit, int offset, System.Threading.CancellationToken cancellationToken = default)
+        {
+            var page = await Emails.SearchAsync(query, limit, offset, cancellationToken);
+            return (page.Items.Select(ToModel).ToList(), page.TotalCount);
+        }
+
+        private static Models.EmailMessage ToModel(StoredEmail r) => new()
+        {
+            Id = r.Id,
+            Subject = r.Subject,
+            SenderName = r.SenderName,
+            SenderAddress = r.SenderAddress,
+            Date = r.Date,
+            Snippet = r.Snippet,
+            BodyLocalPath = r.BodyLocalPath,
+            IsRead = r.IsRead,
+            Mailbox = r.Mailbox,
+            AccountId = r.AccountId,
+            IsStarred = r.IsStarred,
+            ImapUid = r.ImapUid,
+            PreviewState = r.PreviewState,
+        };
 
         /// <summary>
         /// 保存账号：凭据写安全存储，数据库只存非敏感信息（实现见 Core.Storage.AccountRepository）。
