@@ -204,6 +204,15 @@ public class LocalMailSearchTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task SupplementaryChineseSurname_IsSearchableAsSubstring()
+    {
+        var mail = Mail("qq", "INBOX", "联系信息", senderName: "𠮷田先生");
+        await SaveAsync(mail);
+        Assert.Equal(mail.Id, Assert.Single((await SearchAsync("𠮷")).Items).Id);
+        Assert.Equal(mail.Id, Assert.Single((await SearchAsync("from:𠮷")).Items).Id);
+    }
+
+    [Fact]
     public async Task SpecialCharacters_NeverCrash_NoInjection_LiteralLikeMatching()
     {
         await SaveAsync(

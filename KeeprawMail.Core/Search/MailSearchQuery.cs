@@ -173,8 +173,8 @@ public sealed class MailSearchQuery
 
     private static bool HasSearchableChar(string s)
     {
-        foreach (var ch in s)
-            if (char.IsLetterOrDigit(ch)) return true;
+        foreach (var rune in s.EnumerateRunes())
+            if (Rune.IsLetterOrDigit(rune)) return true;
         return false;
     }
 
