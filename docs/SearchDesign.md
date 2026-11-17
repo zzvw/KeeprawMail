@@ -18,7 +18,7 @@ KeeprawMail 的搜索**只在本机 SQLite 数据库中查找已经同步下来�
 
 | 输入 | 含义 |
 | --- | --- |
-| `invoice` | 在主题、发件人姓名、发件人邮箱、摘要中搜索；英文按**词前缀**匹配（`invoic` 也能找到 invoice / invoices），不区分大小写 |
+| `invoice` | 在主题、发件人姓名、发件人邮箱、摘要中搜索；英文保留**词前缀**匹配并补充字面子串匹配（`invoic` 也能找到 invoice / invoices），不区分大小写 |
 | `invoice payment` | 空格分隔的多个词必须**全部**匹配（AND），可以分别出现在不同字段 |
 | `"flight confirmation"` | 引号短语：词序完全一致才匹配（不做前缀扩展） |
 | `subject:invoice` / `subject:"月度 账单"` | 只搜主题 |
@@ -38,15 +38,15 @@ KeeprawMail 的搜索**只在本机 SQLite 数据库中查找已经同步下来�
 
 本 PR 采用不改数据库结构的最小方案：
 
-- **不含中日韩字符的词**（英文、数字、邮箱地址）：FTS5 MATCH，使用现有外部内容表和触发器。
+- **不含中日韩字符的词**（英文、数字、邮箱地址）：普通词使用 `FTS5 MATCH OR LIKE`，保留原有前缀/短语能力，并补充字面子串匹配，避免中文与英文紧连时漏搜。非 CJK 引号短语保持 FTS 精确匹配，不扩展前缀。
 - **含中日韩字符的词**（汉字、假名、谚文，包括“iPhone订单”这类中英紧连的词）：对同样四列做子串匹配
   `IFNULL(col,'') LIKE $p ESCAPE '\'`，`$p` 是参数，`\`、`%`、`_` 已转义。
-- 同一个查询里两类词可以混用（`发票 invoice`）：FTS 条件先缩小范围，子串条件再过滤。
+- 同一个查询里两类词可以混用（`发票 invoice`）：每个词的候选条件独立求 OR，各词之间用 AND；不能将全部 FTS 词合并为必须成立的前置条件。
 
 为什么不用 trigram 分词器：需要新建 FTS 表（结构版本 5 → 6）并对全部邮件重建一次索引；而且 trigram 对最常见的**两个汉字**的词（发票、订单、快递）无法用索引匹配，仍然要回退到扫描。
 四个可搜索列都是短文本（摘要约 200 字），实测 2 万封邮件的中文子串搜索约 30 ms（见第 6 节），因此本 PR 不引入结构变更。
 
-已知限制：英文单词与中文**无空格紧连**时（如主题“购买iPhone成功”），只搜英文 `iphone` 匹配不到（unicode61 把整段当作一个词）；搜索 `iPhone成功` 或中文部分可以找到。
+回归覆盖：“购买iPhone成功”搜 `iphone`、“腾讯QQ邮箱团队”搜 `from:qq`，以及四字段内的中英紧连和混合查询。
 
 ## 4. 查询实现（`KeeprawMail.Core`）
 
@@ -55,13 +55,15 @@ KeeprawMail 的搜索**只在本机 SQLite 数据库中查找已经同步下来�
 
 ```sql
 SELECT <列> FROM Emails
-WHERE rowid IN (SELECT rowid FROM Emails_FTS WHERE Emails_FTS MATCH $Fts)
-  AND (IFNULL(Subject,'') LIKE $L0 ESCAPE '\' OR …)
+WHERE (rowid IN (SELECT rowid FROM Emails_FTS WHERE Emails_FTS MATCH $F0)
+       OR IFNULL(Subject,'') LIKE $L0 ESCAPE '\' OR …)
+  AND (IFNULL(Subject,'') LIKE $L1 ESCAPE '\' OR …)
 ORDER BY julianday(Date) DESC, Date DESC, Id DESC   -- 与首页相同的真实时间排序
 LIMIT $Limit OFFSET $Offset
 ```
 
   另有一条相同 WHERE 的 `COUNT(*)` 返回总数。所有用户输入都通过参数绑定；SQL 文本中只有固定片段、白名单列名和参数名。
+  SQLite VM progress handler 检查取消令牌，中断扫描后按取消处理，并在连接回池前移除回调。
   SQLite 异常被转换为 `MailSearchException("搜索条件无法执行，请修改搜索内容后重试。")`，不向用户显示原始错误。
 - `Id` 是主键、FTS 条件用 `rowid IN (…)`，同一封邮件不会重复返回；身份始终是 `(AccountId, Mailbox, UID)`，不按主题 / 发件人 / 日期推断或合并。
 - `Search/LatestOnlyRunner.cs`：列表加载协调器。收件箱加载、搜索、加载更多都经过它；新请求取消并作废旧请求，旧结果晚到也会被丢弃。
@@ -81,5 +83,5 @@ LIMIT $Limit OFFSET $Offset
 
 - **没有数据库结构变更**：`PRAGMA user_version` 仍为 5；不清空数据库、不重建本地缓存、不触发全量同步；FTS 表与三个触发器不变。
 - 新增、摘要更新（预览 / 打开正文）、归档、服务器删除、删除账号都通过现有触发器维护索引（集成测试逐一验证并执行 FTS5 `integrity-check`）。
-- 实测（Linux CI 的数字由 `search-performance-metrics.txt` 打印）：2 万封邮件，英文 FTS 查询 0–9 ms，中文子串 9–33 ms，均含 COUNT 与 200 封结果读取。
+- 当前性能数据由 Linux CI 的 `search-performance-metrics.txt` 打印（2 万封邮件，含 COUNT 与 200 封结果读取）。加入 LIKE 兜底后，英文查询也可能扫描四个短文本字段；不再沿用修复前纯 FTS 的耗时数据。
 - 网络：搜索的 IMAP 请求数 = 0、下载字节 = 0（`SyncedMail_ImmediatelySearchable_AndSearchCausesNoNetwork` 用可计数的假 IMAP 服务器验证）。

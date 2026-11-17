@@ -92,6 +92,8 @@ public class LocalMailSearchTests : IAsyncLifetime
             Mail("gmail", "INBOX", "Your trip", snippet: "flight confirmation number ABC123", date: T0.AddMinutes(3)));
         Assert.Equal(new[] { "Your trip", "Flight Confirmation: SFO to PVG" }, await SubjectsAsync("\"flight confirmation\""));
         Assert.Equal(3, (await SearchAsync("flight confirmation")).TotalCount);
+        await SaveAsync(Mail("gmail", "INBOX", "flight confirmations"));
+        Assert.Equal(2, (await SearchAsync("\"flight confirmation\"")).TotalCount); // quoted phrases do not expand prefixes
     }
 
     [Fact]
@@ -134,6 +136,71 @@ public class LocalMailSearchTests : IAsyncLifetime
         Assert.Equal(new[] { "购买iPhone订单确认" }, await SubjectsAsync("iPhone订单"));          // 中英紧连
         Assert.Equal(new[] { "购买iPhone订单确认" }, await SubjectsAsync("\"订单 确认\"".Replace(" ", "")));
         Assert.Empty(await SubjectsAsync("发票 还款"));
+    }
+
+    [Theory]
+    [InlineData("购买iPhone成功", "普通姓名", "sender@example.test", "普通摘要", "subject:iphone")]
+    [InlineData("普通主题", "腾讯QQ邮箱团队", "sender@example.test", "普通摘要", "from:qq")]
+    [InlineData("普通主题", "普通姓名", "中文support@example.test", "普通摘要", "from:support")]
+    [InlineData("普通主题", "普通姓名", "sender@example.test", "您的invoice已生成", "invoice")]
+    public async Task EmbeddedLatin_InEachSearchableField_IsNotLostByFts(
+        string subject, string sender, string address, string snippet, string query)
+    {
+        var mail = Mail("qq", "INBOX", subject, snippet, sender, address);
+        await SaveAsync(mail);
+        Assert.Equal(mail.Id, Assert.Single((await SearchAsync(query)).Items).Id);
+        await _db.Emails.IntegrityCheckAsync();
+    }
+
+    [Fact]
+    public async Task MixedFtsAndSubstring_EachTermCanMatchDifferentFields_RespectsFilters()
+    {
+        var wanted = Mail("qq", "INBOX", "您的invoice已生成", "本期账单已出", "腾讯QQ邮箱团队");
+        await SaveAsync(wanted,
+            Mail("gmail", "INBOX", "invoice ready", "账单已出", "Other"),
+            Mail("163", "INBOX", "QQ invoice", "普通摘要", "账单"));
+        Assert.Equal(wanted.Id, Assert.Single((await SearchAsync("subject:invoice from:qq 账单")).Items).Id);
+        Assert.Empty((await SearchAsync("subject:账单 from:qq invoice")).Items);
+        Assert.Empty((await SearchAsync("subject:invoice from:qq 不存在")).Items);
+    }
+
+    [Fact]
+    public async Task CancelledAndConcurrentSearches_DoNotPoisonLaterQueries()
+    {
+        await SaveAsync(Mail("qq", "INBOX", "购买iPhone成功", "电子发票已生成", "腾讯QQ邮箱团队"));
+        Assert.True(MailSearchQuery.TryParse("iphone 发票", out var query, out _));
+        using var cancelled = new CancellationTokenSource();
+        cancelled.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => _db.Emails.SearchAsync(query!, ct: cancelled.Token));
+        var pages = await Task.WhenAll(Enumerable.Range(0, 8).Select(_ =>
+            Task.Run(() => _db.Emails.SearchAsync(query!))));
+        Assert.All(pages, page => Assert.Equal("qq", Assert.Single(page.Items).AccountId));
+        Assert.Single((await SearchAsync("from:qq 发票")).Items);
+    }
+
+    [Fact]
+    public async Task OpenSearchResult_SameUidInOtherAccountsAndFolders_UsesExactIdentity()
+    {
+        var wanted = Mail("qq", "Sent Messages", "identitytarget", uid: 1);
+        await SaveAsync(wanted,
+            Mail("qq", "INBOX", "identitytarget", uid: 1),
+            Mail("gmail", "Sent Messages", "identitytarget", uid: 1));
+        var result = (await SearchAsync("identitytarget")).Items.Single(e => e.Id == wanted.Id);
+        _server.Mailbox("Sent Messages").Add("identitytarget", m => m.Body = "<p>correctbodytoken</p>");
+        var requests = new List<(string Account, string Mailbox)>();
+        var loader = new OnDemandBodyLoader(_db.Emails, _db.Cache, (account, ct) =>
+        {
+            Assert.Equal("qq", account);
+            requests.Add((account, result.Mailbox));
+            return Task.FromResult<IImapMailSession>(_server.CreateSession());
+        });
+        var opened = await loader.EnsureBodyAvailableAsync(new BodyRequest(result.Id, result.AccountId,
+            result.Mailbox, result.ImapUid, result.BodyLocalPath));
+        Assert.True(opened.Success);
+        Assert.Equal(("qq", "Sent Messages"), Assert.Single(requests));
+        Assert.Equal(wanted.Id, Assert.Single((await SearchAsync("correctbodytoken")).Items).Id);
+        Assert.All((await SearchAsync("identitytarget")).Items.Where(e => e.Id != wanted.Id),
+            e => Assert.Empty(e.BodyLocalPath));
     }
 
     [Fact]

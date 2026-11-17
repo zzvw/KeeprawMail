@@ -17,7 +17,7 @@ public enum MailSearchField
 /// <summary>
 /// 一个搜索词。
 /// <see cref="UsesSubstring"/> 为 true（含中日韩字符）时按子串匹配（LIKE，见 <see cref="MailSearchQuery"/> 的说明），
-/// 否则交给 FTS5 MATCH（普通词按前缀匹配，引号短语按完整短语匹配）。
+/// 否则使用 FTS5 MATCH（普通词补充 LIKE 子串兜底，引号短语按完整短语匹配）。
 /// </summary>
 public sealed record MailSearchTerm(MailSearchField Field, string Text, bool IsPhrase)
 {
@@ -37,7 +37,7 @@ public sealed record MailSearchTerm(MailSearchField Field, string Text, bool IsP
 ///
 /// 中文：SQLite FTS5 默认的 unicode61 分词器把连续的中文（无空格）当作一个词，“发票”无法匹配“您的发票已开具”。
 /// 因此含中日韩字符的词按子串匹配（参数化 LIKE，'%' / '_' / '\' 已转义），只扫描 Emails 的四个可搜索列（都是短文本，摘要 ≤ 200 字）；
-/// 同一查询中的其它词仍由 FTS5 MATCH 先缩小范围。这样不需要修改数据库结构，也不需要重建索引。
+/// 同一查询中的普通英文词使用 FTS5 MATCH OR LIKE，避免中文紧连导致漏搜。这样不需要修改数据库结构，也不需要重建索引。
 ///
 /// 所有输入都只作为参数绑定：FTS5 表达式由本类按固定格式生成（每个词都是双引号字符串，内部的双引号成对转义），列名来自白名单。
 /// </summary>
@@ -189,15 +189,20 @@ public sealed class MailSearchQuery
         var parts = new List<string>();
         foreach (var t in FtsTerms)
         {
-            var s = "\"" + t.Text.Replace("\"", "\"\"") + "\"" + (t.IsPhrase ? "" : "*");
-            parts.Add(t.Field switch
-            {
-                MailSearchField.Subject => "Subject : " + s,
-                MailSearchField.From => "{SenderName SenderAddress} : " + s,
-                _ => s,
-            });
+            parts.Add(BuildFtsTermExpression(t));
         }
         return parts.Count == 0 ? null : string.Join(" AND ", parts);
+    }
+
+    internal static string BuildFtsTermExpression(MailSearchTerm term)
+    {
+        var literal = "\"" + term.Text.Replace("\"", "\"\"") + "\"" + (term.IsPhrase ? "" : "*");
+        return term.Field switch
+        {
+            MailSearchField.Subject => "Subject : " + literal,
+            MailSearchField.From => "{SenderName SenderAddress} : " + literal,
+            _ => literal,
+        };
     }
 
     /// <summary>LIKE 模式（参数值）：转义 \ % _，前后加 %。配合 <c>ESCAPE '\'</c> 使用。</summary>

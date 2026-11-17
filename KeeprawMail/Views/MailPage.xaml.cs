@@ -456,19 +456,20 @@ namespace KeeprawMail.Views
                         // await db.DeleteEmailAsync(email.Id); // 需要实现 DeleteEmailAsync
                     }
 
-                    if (ViewModel.SelectedAccount != null)
+                    var account = ViewModel.Accounts.FirstOrDefault(a => a.Id == email.AccountId);
+                    if (account != null)
                     {
-                        System.Diagnostics.Debug.WriteLine($"[MailPage] 准备连接 IMAP 服务器删除邮件: Account={ViewModel.SelectedAccount.Email}");
-                        using (var imap = new Services.ImapService(ViewModel.SelectedAccount))
+                        System.Diagnostics.Debug.WriteLine($"[MailPage] 准备连接 IMAP 服务器删除邮件: Account={account.Email}");
+                        using (var imap = new Services.ImapService(account))
                         {
-                            await imap.ConnectAsync(ViewModel.SelectedAccount);
+                            await imap.ConnectAsync(account);
                             await imap.DeleteMessageAsync(email.Mailbox, email.Id);
                             System.Diagnostics.Debug.WriteLine($"[MailPage] ✓ 邮件删除成功: ID={email.Id}");
                         }
                     }
                     else
                     {
-                        System.Diagnostics.Debug.WriteLine($"[MailPage] ⚠ 未选择账号，跳过 IMAP 删除");
+                        System.Diagnostics.Debug.WriteLine($"[MailPage] ⚠ 找不到邮件所属账号，跳过 IMAP 删除");
                     }
                 }
                 catch (Exception ex)

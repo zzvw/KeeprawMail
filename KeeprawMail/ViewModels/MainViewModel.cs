@@ -511,12 +511,15 @@ namespace KeeprawMail.ViewModels
 
         private async Task RunSearchAsync(Core.Search.MailSearchQuery query, int limit, bool updateStatus)
         {
+            long requestVersion = 0;
             _searchRunning = true;
             RaiseSearchUiChanged();
             if (updateStatus) StatusMessage = $"正在本地搜索“{query.RawText}”…";
             try
             {
-                var result = await _listLoads.RunAsync(ct => Task.Run(() => _databaseContext.SearchEmailsAsync(query, limit, 0, ct), ct));
+                var pending = _listLoads.RunAsync(ct => Task.Run(() => _databaseContext.SearchEmailsAsync(query, limit, 0, ct), ct));
+                requestVersion = _listLoads.Version;
+                var result = await pending;
                 if (!result.IsCurrent || !_listLoads.IsCurrentVersion(result.Version) || !ReferenceEquals(_activeSearch, query) || _listMode != ListMode.Search)
                     return; // 已被更新的搜索 / 清除搜索取代
 
@@ -534,7 +537,7 @@ namespace KeeprawMail.ViewModels
             }
             finally
             {
-                if (ReferenceEquals(_activeSearch, query)) _searchRunning = false;
+                if (_listLoads.IsCurrentVersion(requestVersion) && ReferenceEquals(_activeSearch, query)) _searchRunning = false;
                 RaiseSearchUiChanged();
             }
         }
@@ -546,11 +549,14 @@ namespace KeeprawMail.ViewModels
             if (_listMode != ListMode.Search || _activeSearch == null || _searchRunning) return;
             var query = _activeSearch;
             var offset = Emails.Count;
+            long requestVersion = 0;
             _searchRunning = true;
             RaiseSearchUiChanged();
             try
             {
-                var result = await _listLoads.RunAsync(ct => Task.Run(() => _databaseContext.SearchEmailsAsync(query, SearchPageSize, offset, ct), ct));
+                var pending = _listLoads.RunAsync(ct => Task.Run(() => _databaseContext.SearchEmailsAsync(query, SearchPageSize, offset, ct), ct));
+                requestVersion = _listLoads.Version;
+                var result = await pending;
                 if (!result.IsCurrent || !_listLoads.IsCurrentVersion(result.Version) || !ReferenceEquals(_activeSearch, query) || _listMode != ListMode.Search)
                     return;
                 var (items, total) = result.Value;
@@ -574,7 +580,7 @@ namespace KeeprawMail.ViewModels
             }
             finally
             {
-                if (ReferenceEquals(_activeSearch, query)) _searchRunning = false;
+                if (_listLoads.IsCurrentVersion(requestVersion) && ReferenceEquals(_activeSearch, query)) _searchRunning = false;
                 RaiseSearchUiChanged();
             }
         }
